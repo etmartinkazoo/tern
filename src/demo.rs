@@ -130,6 +130,7 @@ pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Eve
                     answered: i % 5 == 3,
                     has_attachment: i % 6 == 4,
                     message_id: format!("{uid}@demo"),
+                    acct: 0,
                     in_reply_to: String::new(),
                     references: vec![],
                 });

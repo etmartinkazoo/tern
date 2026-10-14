@@ -27,6 +27,7 @@ pub const KEYMAP: &[Section] = &[
         title: "Go to",
         keys: &[
             ("gi", "inbox"),
+            ("gu", "all inboxes (unified, several accounts)"),
             ("gs gd", "sent / drafts"),
             ("ga gt", "archive / trash"),
             ("gj gf", "junk / flagged"),

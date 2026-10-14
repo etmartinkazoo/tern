@@ -176,6 +176,25 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let offset = app.side_cursor.saturating_sub(height.saturating_sub(1));
     app.hits.side_offset = offset;
     for (i, row) in rows.iter().enumerate().skip(offset).take(height) {
+        if row.acct == crate::app::UNIFIED {
+            // All inboxes: every account's INBOX in one list.
+            let open = app.unified();
+            let unread: u32 = app.accts.iter().flat_map(|a| a.folders.iter()).filter(|f| f.role == Role::Inbox).map(|f| f.unread).sum();
+            let count = if unread > 0 { unread.to_string() } else { String::new() };
+            let icon = if app.cfg.ui.icons { "\u{f0e0}" } else { "◆" };
+            let label_w = w.saturating_sub(5 + count.width() + 1);
+            let mut line = Line::from(vec![
+                Span::styled(if open { "▎" } else { " " }, Style::default().fg(t.accent)),
+                Span::styled(format!("{icon} "), Style::default().fg(if open { t.accent } else { t.subtle })),
+                Span::styled(pad("All inboxes", label_w + 2), Style::default().fg(if open { t.fg } else { t.muted }).add_modifier(Modifier::BOLD)),
+                Span::styled(rpad(&count, count.width() + 1), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            ]);
+            if focused && i == app.side_cursor {
+                line = line.style(Style::default().bg(t.sel_bg));
+            }
+            lines.push(line);
+            continue;
+        }
         let a = &app.accts[row.acct];
         let cursor = focused && i == app.side_cursor;
         let Some(fi) = row.folder else {
@@ -233,9 +252,11 @@ fn draw_list(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let w = r.width as usize;
     app.list_height = r.height.saturating_sub(1) as usize;
 
-    let folder = app.current_folder().map(|f| f.label.clone()).unwrap_or_else(|| {
-        app.current.as_ref().map(|c| c.1.clone()).unwrap_or_default()
-    });
+    let folder = if app.unified() {
+        "All inboxes".to_string()
+    } else {
+        app.current_folder().map(|f| f.label.clone()).unwrap_or_else(|| app.current.as_ref().map(|c| c.1.clone()).unwrap_or_default())
+    };
     let mut head = vec![pane_title(&folder, focused, t)];
     let unread = app.current_folder().map(|f| f.unread).unwrap_or(0);
     let mut meta = format!("  {}", app.total);
@@ -270,7 +291,9 @@ fn draw_list(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
 
     let date_w = 6;
     let from_w = (w / 4).clamp(8, 22);
-    let subj_w = w.saturating_sub(4 + from_w + 1 + 1 + date_w + 1);
+    // The unified inbox tags each row with its account.
+    let tag_w = if app.unified() { 4 } else { 0 };
+    let subj_w = w.saturating_sub(4 + from_w + 1 + 1 + date_w + 1 + tag_w);
     let fmt = app.cfg.ui.date_format.clone();
     // In Sent and Drafts the interesting name is who it went to.
     let outgoing = app.current_folder().is_some_and(|f| matches!(f.role, Role::Sent | Role::Drafts));
@@ -350,9 +373,16 @@ fn draw_list(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
             Span::styled(state, Style::default().fg(state_c)),
             Span::styled(flag, Style::default().fg(flag_c)),
             Span::raw(" "),
-            Span::styled(pad(&who, from_w), from_st),
-            Span::raw(" "),
         ];
+        if tag_w > 0 {
+            let name = app.accts.get(e.acct).map(|a| a.cfg.name.as_str()).unwrap_or("?");
+            let short: String = name.chars().take(3).collect();
+            let col = [t.blue, t.magenta, t.green, t.yellow, t.cyan, t.red][e.acct % 6];
+            spans.push(Span::styled(pad(&short, 3), Style::default().fg(col)));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(pad(&who, from_w), from_st));
+        spans.push(Span::raw(" "));
         spans.extend(subj_spans);
         spans.push(Span::raw(" "));
         spans.push(Span::styled(rpad(&short_date(e.date, &fmt), date_w), Style::default().fg(if unread { t.accent } else { t.subtle })));
@@ -467,7 +497,7 @@ fn human_size(n: usize) -> String {
 }
 
 fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
-    let from = app.accts[app.current.as_ref().map(|c| c.0).unwrap_or(0)].cfg.sender_mailbox();
+    let from = app.accts.get(app.compose_acct()).map(|a| a.cfg.sender_mailbox()).unwrap_or_default();
     let active = matches!(app.mode, Mode::Compose(_));
     if let Some(c) = app.composer_mut() {
         return draw_composer(f, c, active, &from, r, t);
@@ -494,7 +524,7 @@ fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
                 .collect()
         })
         .unwrap_or_default();
-    let me = app.current.as_ref().map(|c| app.accts[c.0].cfg.email.to_lowercase()).unwrap_or_default();
+    let me = app.accts.get(app.open_acct()).map(|a| a.cfg.email.to_lowercase()).unwrap_or_default();
     // Your answer lives in your calendar's copy once you've given one.
     let answered = invite.as_ref().and_then(|inv| {
         let needle = format!("UID:{}", inv.uid);
@@ -720,7 +750,7 @@ fn draw_conversation(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let w = r.width as usize;
     let icons = Icons { on: app.cfg.ui.icons };
     let fmt = app.cfg.ui.date_format.clone();
-    let me = app.current.as_ref().map(|c| app.accts[c.0].cfg.email.clone()).unwrap_or_default();
+    let me = app.accts.get(app.open_acct()).map(|a| a.cfg.email.clone()).unwrap_or_default();
 
     let mut head: Vec<Line> = Vec::new();
     let subject = app.all[th.members[0]].subject.clone();
@@ -1104,7 +1134,8 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
         spans.push(Span::styled(format!(" Calendar › {} ", d.format("%a %e %b %Y")), Style::default().fg(t.muted)));
     } else if let Some((a, _)) = &app.current {
         let folder = app.current_folder().map(|f| f.label.clone()).unwrap_or_default();
-        spans.push(Span::styled(format!(" {} › {folder} ", app.accts[*a].cfg.name), Style::default().fg(t.muted)));
+        let where_ = if *a == crate::app::UNIFIED { "All inboxes".to_string() } else { format!("{} › {folder}", app.accts[*a].cfg.name) };
+        spans.push(Span::styled(format!(" {where_} "), Style::default().fg(t.muted)));
     }
     if app.zoom {
         spans.push(Span::styled(" zoom ", Style::default().fg(t.cyan)));

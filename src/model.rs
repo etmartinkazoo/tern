@@ -40,6 +40,8 @@ pub struct Envelope {
     pub answered: bool,
     pub has_attachment: bool,
     pub message_id: String,
+    /// Which account it came from (set when it arrives in the app).
+    pub acct: usize,
     pub in_reply_to: String,
     pub references: Vec<String>,
 }

@@ -57,6 +57,7 @@ pub fn envelope(
         answered: has("\\Answered"),
         has_attachment: false,
         message_id: String::new(),
+        acct: 0,
         in_reply_to: String::new(),
         references: Vec::new(),
     };

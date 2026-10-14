@@ -88,6 +88,9 @@ pub enum DavRow {
     Add,
 }
 
+/// The account index of the unified inbox ("All inboxes").
+pub const UNIFIED: usize = usize::MAX;
+
 pub struct SideRow {
     pub acct: usize,
     pub folder: Option<usize>,
@@ -160,6 +163,11 @@ pub struct App {
     pub cal: crate::calview::CalState,
     /// The settings view, set aside while an account form is open over it.
     pub parked_settings: Option<Box<Settings>>,
+    /// Unified inbox bookkeeping: view ids ⇄ (account, uid), per-account totals.
+    ids: HashMap<(usize, u32), u32>,
+    rev: HashMap<u32, (usize, u32)>,
+    next_id: u32,
+    unified_totals: HashMap<usize, u32>,
     /// The last message sent, still undoable: (outbox id, its composer, when).
     undo: Option<(String, Box<Composer>, Instant)>,
     /// Outbox messages currently being sent, and how many are queued.
@@ -234,6 +242,10 @@ impl App {
             parked_settings: None,
             collapsed: load_ui_state(),
             undo: None,
+            ids: HashMap::new(),
+            rev: HashMap::new(),
+            next_id: 0,
+            unified_totals: HashMap::new(),
             sending: HashSet::new(),
             outbox_count: crate::outbox::list().len(),
             last_outbox: Instant::now(),
@@ -269,7 +281,9 @@ impl App {
         for a in &self.accts {
             let _ = a.tx.send(Cmd::Folders);
         }
-        if !self.accts.is_empty() {
+        if self.accts.len() > 1 {
+            self.open_folder(UNIFIED, "INBOX".into());
+        } else if !self.accts.is_empty() {
             self.open_folder(0, "INBOX".into());
         }
         let stale = contacts::cache_age().is_none_or(|a| a > Duration::from_secs(3600));
@@ -360,8 +374,62 @@ impl App {
     }
 
     pub fn cached(&self, uid: u32) -> Option<&Body> {
-        let (a, f) = self.current.as_ref()?;
-        self.cache.get(&(*a, f.clone(), uid))
+        let k = self.key(uid)?;
+        self.cache.get(&k)
+    }
+
+    /// Whether the open list is the unified inbox (every account's INBOX).
+    pub fn unified(&self) -> bool {
+        self.current.as_ref().is_some_and(|c| c.0 == UNIFIED)
+    }
+
+    /// The id a message has in the list. In the unified inbox UIDs from different
+    /// accounts can collide, so each (account, uid) gets its own; elsewhere it's the UID.
+    fn view_id(&mut self, acct: usize, uid: u32) -> u32 {
+        if !self.unified() {
+            return uid;
+        }
+        if let Some(&v) = self.ids.get(&(acct, uid)) {
+            return v;
+        }
+        self.next_id += 1;
+        let v = self.next_id;
+        self.ids.insert((acct, uid), v);
+        self.rev.insert(v, (acct, uid));
+        v
+    }
+
+    /// Where a listed message really lives: (account, folder, server uid).
+    fn real(&self, view: u32) -> Option<(usize, String, u32)> {
+        let (a, f) = self.current.clone()?;
+        if a == UNIFIED {
+            let (acct, uid) = *self.rev.get(&view)?;
+            Some((acct, "INBOX".into(), uid))
+        } else {
+            Some((a, f, view))
+        }
+    }
+
+    /// Group listed messages by the account and folder their commands go to.
+    fn route(&self, uids: &[u32]) -> Vec<(usize, String, Vec<u32>)> {
+        let mut out: Vec<(usize, String, Vec<u32>)> = Vec::new();
+        for &v in uids {
+            let Some((a, f, u)) = self.real(v) else { continue };
+            match out.iter_mut().find(|(x, y, _)| *x == a && *y == f) {
+                Some(g) => g.2.push(u),
+                None => out.push((a, f, vec![u])),
+            }
+        }
+        out
+    }
+
+    /// The account the selected message belongs to (the open account outside the
+    /// unified inbox).
+    fn msg_acct(&self) -> usize {
+        match self.selected().and_then(|e| self.real(e.uid)) {
+            Some((a, _, _)) => a,
+            None => self.acct_idx(),
+        }
     }
 
     /// The row showing `uid`, or the folded conversation that contains it.
@@ -378,12 +446,12 @@ impl App {
     }
 
     fn me(&self) -> String {
-        self.current.as_ref().map(|c| self.accts[c.0].cfg.email.clone()).unwrap_or_default()
+        self.accts.get(self.acct_idx()).map(|a| a.cfg.email.clone()).unwrap_or_default()
     }
 
     pub fn current_folder(&self) -> Option<&Folder> {
         let (a, name) = self.current.as_ref()?;
-        self.accts[*a].folders.iter().find(|f| &f.name == name)
+        self.accts.get(*a)?.folders.iter().find(|f| &f.name == name)
     }
 
     fn folder_for(&self, acct: usize, role: Role) -> Option<String> {
@@ -393,6 +461,9 @@ impl App {
     pub fn side_rows(&self) -> Vec<SideRow> {
         let mut rows = Vec::new();
         let multi = self.accts.len() > 1;
+        if multi {
+            rows.push(SideRow { acct: UNIFIED, folder: None });
+        }
         for (ai, a) in self.accts.iter().enumerate() {
             if multi {
                 rows.push(SideRow { acct: ai, folder: None });
@@ -432,6 +503,15 @@ impl App {
         self.body = None;
         self.requested = None;
         self.loading = true;
+        self.ids.clear();
+        self.rev.clear();
+        if acct == UNIFIED {
+            for a in 0..self.accts.len() {
+                self.send(a, Cmd::Select { folder: "INBOX".into() });
+            }
+            self.side_cursor = 0;
+            return;
+        }
         self.send(acct, Cmd::Select { folder: name });
         // Keep the sidebar cursor on the folder we just opened.
         if let Some(i) = self.side_rows().iter().position(|r| {
@@ -444,7 +524,7 @@ impl App {
     }
 
     fn goto_role(&mut self, role: Role) {
-        let acct = self.current.as_ref().map(|c| c.0).unwrap_or(0);
+        let acct = self.acct_idx();
         let name = if role == Role::Inbox {
             Some("INBOX".to_string())
         } else {
@@ -598,8 +678,7 @@ impl App {
     }
 
     fn key(&self, uid: u32) -> Option<(usize, String, u32)> {
-        let (a, f) = self.current.clone()?;
-        Some((a, f, uid))
+        self.real(uid)
     }
 
     fn mark_seen(&mut self) {
@@ -607,18 +686,8 @@ impl App {
             let uids: Vec<u32> = t.members.iter().map(|&i| self.all[i].uid).collect();
             return self.set_seen(uids, true);
         }
-        let Some(e) = self.selected_mut() else { return };
-        if e.seen {
-            return;
-        }
-        e.seen = true;
-        let uid = e.uid;
-        if let Some((a, f)) = self.current.clone() {
-            if let Some(fo) = self.accts[a].folders.iter_mut().find(|x| x.name == f) {
-                fo.unread = fo.unread.saturating_sub(1);
-            }
-            self.send(a, Cmd::SetFlag { folder: f, uids: vec![uid], flag: "\\Seen", on: true });
-        }
+        let Some(uid) = self.selected().filter(|e| !e.seen).map(|e| e.uid) else { return };
+        self.set_seen(vec![uid], true);
     }
 
     // ---------------------------------------------------------------- events
@@ -640,7 +709,7 @@ impl App {
             }
             Event::Folders(a, folders) => {
                 self.accts[a].folders = folders;
-                let cur = self.current.clone();
+                let cur = self.current.clone().filter(|c| c.0 != UNIFIED);
                 if let Some((ca, cf)) = cur {
                     if ca == a {
                         if let Some(i) = self.side_rows().iter().position(|r| {
@@ -652,15 +721,30 @@ impl App {
                 }
             }
             Event::Envelopes { acct, folder, items, total } => {
-                if self.current.as_ref() != Some(&(acct, folder)) {
+                let merge = self.unified() && folder == "INBOX";
+                if self.current.as_ref() != Some(&(acct, folder)) && !merge {
                     return;
                 }
                 let keep = self.cursor_candidates();
                 let fresh = self.all.is_empty();
+                let mut items = items;
+                for e in items.iter_mut() {
+                    e.acct = acct;
+                    e.uid = self.view_id(acct, e.uid);
+                }
                 let before: HashSet<u32> = self.all.iter().map(|e| e.uid).collect();
                 let new = items.iter().filter(|e| !e.seen && !before.contains(&e.uid)).count();
-                self.all = items;
-                self.total = total;
+                if merge {
+                    // Replace this account's part of the unified list, newest first overall.
+                    self.all.retain(|e| e.acct != acct);
+                    self.all.extend(items);
+                    self.all.sort_by(|a, b| b.date.cmp(&a.date).then(b.uid.cmp(&a.uid)));
+                    self.unified_totals.insert(acct, total);
+                    self.total = self.unified_totals.values().sum();
+                } else {
+                    self.all = items;
+                    self.total = total;
+                }
                 self.loading = false;
                 self.marked.retain(|u| self.all.iter().any(|e| e.uid == *u));
                 self.refilter_to(&keep);
@@ -670,27 +754,35 @@ impl App {
                     self.say(format!("{new} new"));
                 }
             }
-            Event::Body { acct, folder, body } => {
+            Event::Body { acct, folder, mut body } => {
                 let key = (acct, folder, body.uid);
+                // The list knows this message by its view id.
+                if self.unified() {
+                    match self.ids.get(&(acct, body.uid)) {
+                        Some(&v) => body.uid = v,
+                        None => body.uid = 0,
+                    }
+                }
                 if self.cache_order.len() >= 256 {
                     if let Some(old) = self.cache_order.pop_front() {
                         self.cache.remove(&old);
                     }
                 }
                 self.cache_order.push_back(key.clone());
-                self.cache.insert(key.clone(), (*body).clone());
-                if self.current.as_ref() == Some(&(key.0, key.1.clone()))
-                    && self.selected().map(|e| e.uid) == Some(body.uid)
-                {
+                let mut cached = (*body).clone();
+                cached.uid = key.2;
+                self.cache.insert(key.clone(), cached);
+                let view_uid = body.uid;
+                if self.selected().map(|e| e.uid) == Some(body.uid) && self.real(body.uid).as_ref() == Some(&key) {
                     self.shown = Some((body.uid, Instant::now()));
                     self.body = Some(*body);
                 }
-                if self.requested == Some(key.2) {
+                if self.requested == Some(view_uid) {
                     self.requested = None;
                 }
             }
             Event::Changed { acct, folder } => {
-                if self.current.as_ref() == Some(&(acct, folder.clone())) {
+                if self.current.as_ref() == Some(&(acct, folder.clone())) || (self.unified() && folder == "INBOX") {
                     self.send(acct, Cmd::Poll { folder });
                     self.last_poll = Instant::now();
                 } else {
@@ -700,13 +792,22 @@ impl App {
             Event::Removed { acct, folder, uids } => {
                 if self.current.as_ref() == Some(&(acct, folder.clone())) {
                     self.remove_local(&uids);
+                } else if self.unified() && folder == "INBOX" {
+                    let views: Vec<u32> = uids.iter().filter_map(|u| self.ids.get(&(acct, *u)).copied()).collect();
+                    self.remove_local(&views);
                 }
             }
             Event::SearchResult { acct, folder, items, query } => {
-                if self.current.as_ref() != Some(&(acct, folder)) || self.filter != query {
+                let merge = self.unified() && folder == "INBOX";
+                if (self.current.as_ref() != Some(&(acct, folder)) && !merge) || self.filter != query {
                     return;
                 }
                 let keep = self.cursor_candidates();
+                let mut items = items;
+                for e in items.iter_mut() {
+                    e.acct = acct;
+                    e.uid = self.view_id(acct, e.uid);
+                }
                 let have: HashSet<u32> = self.all.iter().map(|e| e.uid).collect();
                 let uids: Vec<u32> = items.iter().map(|e| e.uid).collect();
                 let mut added = 0;
@@ -749,10 +850,10 @@ impl App {
         // Called twice per move (optimistically, then on the server's confirmation), so
         // only count what is actually still here.
         let present = self.all.iter().filter(|e| gone.contains(&e.uid)).count() as u32;
-        let unread = self.all.iter().filter(|e| gone.contains(&e.uid) && !e.seen).count() as u32;
-        if let Some((a, f)) = self.current.clone() {
-            if let Some(fo) = self.accts[a].folders.iter_mut().find(|x| x.name == f) {
-                fo.unread = fo.unread.saturating_sub(unread);
+        let unread: Vec<u32> = self.all.iter().filter(|e| gone.contains(&e.uid) && !e.seen).map(|e| e.uid).collect();
+        for (a, f, u) in self.route(&unread) {
+            if let Some(fo) = self.accts.get_mut(a).and_then(|s| s.folders.iter_mut().find(|x| x.name == f)) {
+                fo.unread = fo.unread.saturating_sub(u.len() as u32);
             }
         }
         self.all.retain(|e| !gone.contains(&e.uid));
@@ -780,22 +881,24 @@ impl App {
             if at.elapsed() > Duration::from_millis(60) {
                 self.want_body = None;
                 if self.selected().map(|e| e.uid) == Some(uid) {
-                    if let Some((a, f)) = self.current.clone() {
-                        let missing: Option<Vec<u32>> = self.conv_thread().map(|t| {
-                            t.chrono.iter().rev().take(40).map(|&i| self.all[i].uid).filter(|&u| self.cached(u).is_none()).collect()
-                        });
-                        match missing {
-                            Some(uids) if !uids.is_empty() => {
-                                self.requested = Some(uid);
-                                self.send(a, Cmd::Bodies { folder: f, uids });
+                    let missing: Option<Vec<u32>> = self.conv_thread().map(|t| {
+                        t.chrono.iter().rev().take(40).map(|&i| self.all[i].uid).filter(|&u| self.cached(u).is_none()).collect()
+                    });
+                    match missing {
+                        Some(uids) if !uids.is_empty() => {
+                            self.requested = Some(uid);
+                            for (a, f, real) in self.route(&uids) {
+                                self.send(a, Cmd::Bodies { folder: f, uids: real });
                             }
-                            Some(_) => {}
-                            None if self.requested != Some(uid) => {
-                                self.requested = Some(uid);
-                                self.send(a, Cmd::Body { folder: f, uid });
-                            }
-                            None => {}
                         }
+                        Some(_) => {}
+                        None if self.requested != Some(uid) => {
+                            self.requested = Some(uid);
+                            if let Some((a, f, real)) = self.real(uid) {
+                                self.send(a, Cmd::Body { folder: f, uid: real });
+                            }
+                        }
+                        None => {}
                     }
                 }
             }
@@ -822,11 +925,14 @@ impl App {
     }
 
     fn poll(&mut self) {
-        if let Some((a, f)) = self.current.clone() {
+        let unified = self.unified();
+        if let Some((a, f)) = self.current.clone().filter(|_| !unified) {
             self.send(a, Cmd::Poll { folder: f });
         }
         for (i, a) in self.accts.iter().enumerate() {
-            if self.current.as_ref().map(|c| c.0) != Some(i) {
+            if unified {
+                let _ = a.tx.send(Cmd::Poll { folder: "INBOX".into() });
+            } else if self.current.as_ref().map(|c| c.0) != Some(i) {
                 let _ = a.tx.send(Cmd::Folders);
             }
         }
@@ -872,6 +978,10 @@ impl App {
                 match k.code {
                     KeyCode::Char('g') => self.top(),
                     KeyCode::Char('i') => self.goto_role(Role::Inbox),
+                    KeyCode::Char('u') if self.accts.len() > 1 => {
+                        self.open_folder(UNIFIED, "INBOX".into());
+                        self.focus = Focus::List;
+                    }
                     KeyCode::Char('s') => self.goto_role(Role::Sent),
                     KeyCode::Char('d') => self.goto_role(Role::Drafts),
                     KeyCode::Char('a') => self.goto_role(Role::Archive),
@@ -1115,6 +1225,9 @@ impl App {
     /// Fold or unfold an account's folders in the sidebar (the accordion). The cursor
     /// lands on the account's heading so it stays put on screen.
     fn toggle_account(&mut self, acct: usize) {
+        if acct == UNIFIED {
+            return self.open_folder(UNIFIED, "INBOX".into());
+        }
         let name = self.accts[acct].cfg.name.clone();
         if !self.collapsed.remove(&name) {
             self.collapsed.insert(name);
@@ -1178,7 +1291,6 @@ impl App {
     fn toggle_flag(&mut self) {
         // On a folded conversation, flag its latest message, as Gmail does.
         let uids = if self.marked.is_empty() { self.selected().map(|e| vec![e.uid]).unwrap_or_default() } else { self.targets() };
-        let Some((a, f)) = self.current.clone() else { return };
         let Some(first) = self.all.iter().find(|e| uids.contains(&e.uid)) else { return };
         let on = !first.flagged;
         for e in self.all.iter_mut().filter(|e| uids.contains(&e.uid)) {
@@ -1187,7 +1299,9 @@ impl App {
         for t in self.threads.iter_mut() {
             t.flagged = t.members.iter().any(|&i| self.all[i].flagged);
         }
-        self.send(a, Cmd::SetFlag { folder: f, uids, flag: "\\Flagged", on });
+        for (a, f, real) in self.route(&uids) {
+            self.send(a, Cmd::SetFlag { folder: f, uids: real, flag: "\\Flagged", on });
+        }
     }
 
     fn toggle_seen(&mut self) {
@@ -1203,7 +1317,6 @@ impl App {
     }
 
     fn set_seen(&mut self, uids: Vec<u32>, on: bool) {
-        let Some((a, f)) = self.current.clone() else { return };
         let mut changed = Vec::new();
         for e in self.all.iter_mut().filter(|e| uids.contains(&e.uid) && e.seen != on) {
             e.seen = on;
@@ -1212,63 +1325,107 @@ impl App {
         if changed.is_empty() {
             return;
         }
-        let delta = if on { -(changed.len() as i64) } else { changed.len() as i64 };
-        if let Some(fo) = self.accts[a].folders.iter_mut().find(|x| x.name == f) {
-            fo.unread = (fo.unread as i64 + delta).max(0) as u32;
-        }
         for t in self.threads.iter_mut() {
             t.unread = t.members.iter().filter(|&&i| !self.all[i].seen).count();
         }
-        self.send(a, Cmd::SetFlag { folder: f, uids: changed, flag: "\\Seen", on });
+        for (a, f, real) in self.route(&changed) {
+            let delta = if on { -(real.len() as i64) } else { real.len() as i64 };
+            if let Some(fo) = self.accts.get_mut(a).and_then(|s| s.folders.iter_mut().find(|x| x.name == f)) {
+                fo.unread = (fo.unread as i64 + delta).max(0) as u32;
+            }
+            self.send(a, Cmd::SetFlag { folder: f, uids: real, flag: "\\Seen", on });
+        }
     }
 
-    fn move_to(&mut self, to: String, verb: &str) {
+    /// Move the targets; `dest` names the folder per account (a role like Archive is a
+    /// different folder on each).
+    fn move_each(&mut self, dest: impl Fn(&App, usize) -> Option<String>, verb: &str) {
         let uids = self.targets();
-        let Some((a, f)) = self.current.clone() else { return };
-        if uids.is_empty() || to == f {
+        if uids.is_empty() {
             return;
+        }
+        let groups = self.route(&uids);
+        let mut moved = 0;
+        let mut missing = Vec::new();
+        for (a, f, real) in &groups {
+            match dest(self, *a) {
+                Some(to) if &to != f => {
+                    moved += real.len();
+                    self.send(*a, Cmd::Move { folder: f.clone(), uids: real.clone(), to });
+                }
+                Some(_) => {}
+                None => missing.push(self.accts[*a].cfg.name.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            return self.fail(format!("no folder to {verb} to on {} — set it under [accounts.folders]", missing.join(", ")));
         }
         // Optimistic: drop from the list now; the server confirms with Removed.
         self.remove_local(&uids);
-        self.say(format!("{verb} {} → {}", uids.len(), to));
-        self.send(a, Cmd::Move { folder: f, uids, to });
+        self.say(format!("{verb} {moved}"));
+    }
+
+    fn move_to(&mut self, to: String, verb: &str) {
+        if self.unified() && self.route(&self.targets()).len() > 1 {
+            return self.fail("those are in different accounts — move them from each account's inbox");
+        }
+        self.move_each(move |_, _| Some(to.clone()), verb);
     }
 
     fn move_to_role(&mut self, role: Role) {
-        let Some((a, _)) = self.current.clone() else { return };
-        match self.folder_for(a, role) {
-            Some(to) => self.move_to(to, &format!("{role:?}").to_lowercase()),
-            None => self.fail(format!("no {role:?} folder — set it under [accounts.folders]")),
-        }
+        let verb = format!("{role:?}").to_lowercase();
+        self.move_each(move |app, a| app.folder_for(a, role), &verb);
     }
 
     fn trash(&mut self) {
-        let Some((a, f)) = self.current.clone() else { return };
         let in_trash = self.current_folder().map(|x| x.role == Role::Trash).unwrap_or(false);
-        if in_trash || self.folder_for(a, Role::Trash).is_none() {
-            let uids = self.targets();
-            if uids.is_empty() {
-                return;
+        let uids = self.targets();
+        if uids.is_empty() {
+            return;
+        }
+        // Accounts with a Trash folder move there; inside Trash (or without one) it's for good.
+        let groups = self.route(&uids);
+        let mut purged = 0;
+        for (a, f, real) in &groups {
+            if in_trash || self.folder_for(*a, Role::Trash).is_none() {
+                purged += real.len();
+                self.send(*a, Cmd::Expunge { folder: f.clone(), uids: real.clone() });
+            } else if let Some(to) = self.folder_for(*a, Role::Trash) {
+                self.send(*a, Cmd::Move { folder: f.clone(), uids: real.clone(), to });
             }
-            self.remove_local(&uids);
-            self.say(format!("deleted {} permanently", uids.len()));
-            self.send(a, Cmd::Expunge { folder: f, uids });
+        }
+        self.remove_local(&uids);
+        if purged > 0 {
+            self.say(format!("deleted {purged} permanently"));
         } else {
-            self.move_to_role(Role::Trash);
+            self.say(format!("trash {}", uids.len()));
         }
     }
 
     fn archive(&mut self) {
-        let Some((a, _)) = self.current.clone() else { return };
-        if self.folder_for(a, Role::Archive).is_some() {
-            self.move_to_role(Role::Archive)
-        } else {
-            self.move_to_role(Role::All)
+        self.move_each(|app, a| app.folder_for(a, Role::Archive).or_else(|| app.folder_for(a, Role::All)), "archive");
+    }
+
+    /// For drawing: the account a message on screen belongs to.
+    pub fn open_acct(&self) -> usize {
+        self.acct_idx()
+    }
+
+    /// The account the composer on screen sends from.
+    pub fn compose_acct(&self) -> usize {
+        match &self.mode {
+            Mode::Compose(c) => c.from_acct.unwrap_or_else(|| self.acct_idx()),
+            _ => self.acct_idx(),
         }
     }
 
+    /// The open account (in the unified inbox: the selected message's, else the first).
     fn acct_idx(&self) -> usize {
-        self.current.as_ref().map(|c| c.0).unwrap_or(0)
+        match self.current.as_ref() {
+            Some((a, _)) if *a == UNIFIED => self.selected().and_then(|e| self.rev.get(&e.uid)).map(|x| x.0).unwrap_or(0),
+            Some((a, _)) => *a,
+            None => 0,
+        }
     }
 
     fn respond(&mut self, kind: Kind) {
@@ -1276,9 +1433,11 @@ impl App {
             self.fail("message still loading");
             return;
         };
-        let a = self.acct_idx();
-        let folder = self.current.as_ref().map(|c| c.1.clone()).unwrap_or_default();
-        let d = compose::respond(kind, b, &self.accts[a].cfg, a, &folder);
+        // Reply from the account (and as the message) it actually came to.
+        let Some((a, folder, real_uid)) = self.real(b.uid) else { return };
+        let mut b = b.clone();
+        b.uid = real_uid;
+        let d = compose::respond(kind, &b, &self.accts[a].cfg, a, &folder);
         let title = match kind {
             Kind::Reply => "Reply",
             Kind::ReplyAll => "Reply all",
@@ -1361,8 +1520,8 @@ impl App {
             }
         };
         if let Some(e) = self.selected().map(|e| e.uid) {
-            if let Some((_, f)) = self.current.clone() {
-                self.send(a, Cmd::SetFlag { folder: f, uids: vec![e], flag: "\\Answered", on: true });
+            for (acc, f, real) in self.route(&[e]) {
+                self.send(acc, Cmd::SetFlag { folder: f, uids: real, flag: "\\Answered", on: true });
             }
         }
         if self.demo {
@@ -1679,7 +1838,13 @@ impl App {
                 if !self.filter.is_empty() {
                     if let Some((a, f)) = self.current.clone() {
                         self.say(format!("searching server for “{}”…", self.filter));
-                        self.send(a, Cmd::Search { folder: f, query: self.filter.clone() });
+                        if a == UNIFIED {
+                            for i in 0..self.accts.len() {
+                                self.send(i, Cmd::Search { folder: "INBOX".into(), query: self.filter.clone() });
+                            }
+                        } else {
+                            self.send(a, Cmd::Search { folder: f, query: self.filter.clone() });
+                        }
                     }
                     self.focus = Focus::List;
                 }
@@ -2451,7 +2616,7 @@ impl App {
         if d.to.trim().is_empty() && d.subject.trim().is_empty() && d.body.trim().is_empty() {
             return;
         }
-        let account = c.from_acct.or(self.current.as_ref().map(|x| x.0)).and_then(|i| self.accts.get(i)).map(|a| a.cfg.name.clone());
+        let account = c.from_acct.or(Some(self.acct_idx())).and_then(|i| self.accts.get(i)).map(|a| a.cfg.name.clone());
         crate::drafts::save(&crate::drafts::Saved { title: c.title.clone(), account, draft: d, saved_at: crate::outbox::now() });
     }
 
@@ -2730,6 +2895,7 @@ mod tests {
                 answered: false,
                 has_attachment: false,
                 message_id: String::new(),
+                acct: 0,
                 in_reply_to: String::new(),
                 references: vec![],
             })
