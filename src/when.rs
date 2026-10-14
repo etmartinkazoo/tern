@@ -256,6 +256,46 @@ pub fn parse_on(input: &str, today: NaiveDate, default: NaiveDate) -> Option<Dra
     Some(Draft { title, date, start, end, days, location, ..Default::default() })
 }
 
+/// The first date (and a time near it) mentioned in free text, like an email asking to
+/// "meet Thursday at 2pm" or listing "Oct 20, 10:30–11:30".
+pub fn find_in(text: &str, today: NaiveDate) -> (Option<NaiveDate>, Option<NaiveTime>, Option<NaiveTime>) {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| ",.;!?()\"'".contains(c)).to_string())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    // Words that are dates only in context ("may", "sun", "mar") need a number or a
+    // weekday next to them to count.
+    let ambiguous = |w: &str| matches!(w.to_lowercase().as_str(), "may" | "sun" | "mar" | "sat" | "wed" | "next");
+    for i in 0..refs.len() {
+        let Some((d, n)) = date_at(&refs[i..], today) else { continue };
+        if n == 1 && ambiguous(refs[i]) && !refs[i].chars().next().is_some_and(|c| c.is_uppercase()) {
+            continue;
+        }
+        // A time within the next few words: "at 2pm", "10:30-11:30".
+        let mut start = None;
+        let mut end = None;
+        for w in refs.iter().skip(i + n).take(5) {
+            if let Some((a, b)) = w.split_once(['-', '–']) {
+                let suffix = if b.ends_with("pm") { "pm" } else if b.ends_with("am") { "am" } else { "" };
+                let a_full = if a.contains(':') || a.ends_with('m') { a.to_string() } else { format!("{a}{suffix}") };
+                if let (Some(s), Some(e)) = (time(&a_full).or_else(|| time(&format!("{a}:00"))), time(b).or_else(|| time(&format!("{b}:00")))) {
+                    start = Some(s);
+                    end = Some(e);
+                    break;
+                }
+            }
+            if let Some(t) = time(w) {
+                start = Some(t);
+                break;
+            }
+        }
+        return (Some(d), start, end);
+    }
+    (None, None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +336,18 @@ mod tests {
         assert_eq!(parse("Taxes mar 1", today()).unwrap().date, NaiveDate::from_ymd_opt(2027, 3, 1).unwrap());
         assert!(parse("tomorrow 9am", today()).is_none());
         assert_eq!(parse("Retro next fri", today()).unwrap().date, NaiveDate::from_ymd_opt(2026, 10, 23).unwrap());
+    }
+
+    #[test]
+    fn finds_dates_in_mail() {
+        let (d, s, e) = find_in("Hi Ted, can we meet Thursday at 2pm to go over the deck?", today());
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 10, 15));
+        assert_eq!((s, e), (t(14, 0), None));
+        let (d, s, e) = find_in("Agenda for Oct 20, 10:30-11:30 in room 4", today());
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 10, 20));
+        assert_eq!((s, e), (t(10, 30), t(11, 30)));
+        // "may" as a verb isn't a month.
+        assert_eq!(find_in("you may want to review this", today()).0, None);
     }
 
     #[test]

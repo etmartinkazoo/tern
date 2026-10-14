@@ -560,6 +560,70 @@ impl App {
         }
     }
 
+    /// ge on a message: a new event from it, open in the form to check and save.
+    pub fn event_from_message(&mut self) {
+        let Some(b) = self.body.clone() else {
+            return self.say("open a message first");
+        };
+        let Some(cal) = self.cal.target() else {
+            return self.say_error("no calendar to add to — add one in Settings → Calendars");
+        };
+        let today = calendar::today();
+        let subject = b.subject.clone();
+        // The subject without its Re:/Fwd: prefixes, case kept.
+        let mut title = subject.trim().to_string();
+        loop {
+            let lower = title.to_lowercase();
+            match ["re:", "fwd:", "fw:", "aw:"].iter().find(|p| lower.starts_with(*p)) {
+                Some(p) => title = title[p.len()..].trim_start().to_string(),
+                None => break,
+            }
+        }
+        let text: String = b.text.lines().filter(|l| !l.trim_start().starts_with('>')).collect::<Vec<_>>().join("\n");
+        let (date, start, end) = crate::when::find_in(&format!("{subject}\n{text}"), today);
+        // A call link in the mail is the obvious place.
+        let link = text
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| "<>()[],.\"'".contains(c)))
+            .find(|w| ["meet.google.com/", "zoom.us/", "teams.microsoft.com/", "whereby.com/", "webex.com/"].iter().any(|h| w.contains(h)))
+            .map(String::from)
+            .unwrap_or_default();
+        let me = self.accts.get(self.acct_idx()).map(|a| a.cfg.email.to_lowercase()).unwrap_or_default();
+        let people: Vec<String> = [b.from.as_str(), b.to.as_str(), b.cc.as_str()]
+            .iter()
+            .flat_map(|s| s.split(", "))
+            .filter(|p| !p.trim().is_empty() && !p.to_lowercase().contains(&me))
+            .map(String::from)
+            .collect();
+        let excerpt: String = text.lines().filter(|l| !l.trim().is_empty()).take(12).collect::<Vec<_>>().join("\n");
+        let mut notes = format!("From the email “{subject}” ({}, {})", b.from, b.date);
+        if !people.is_empty() {
+            notes.push_str(&format!("\nPeople: {}", people.join(", ")));
+        }
+        notes.push_str(&format!("\n\n{excerpt}"));
+        let start_t = start;
+        let d = crate::when::Draft {
+            title,
+            date: date.unwrap_or(today),
+            start: start_t,
+            end: end.or(start_t.map(|s| s + chrono::Duration::hours(1))),
+            days: 1,
+            location: link.clone(),
+            url: link,
+            description: notes,
+        };
+        let name = self.cal.calendars[cal].name.clone();
+        let form = crate::composer::EventForm { calendar: cal, item: None };
+        let mut c = crate::composer::Composer::new_event(&format!("New event · {name}"), &d, form);
+        c.note = match (date, start) {
+            (Some(_), Some(_)) => "Date and time found in the message — check them, then ^s".into(),
+            (Some(_), None) => "Date found in the message; add a time or leave it all day, then ^s".into(),
+            _ => "No date in the message — set Date and Start, then ^s".into(),
+        };
+        c.focus = 1;
+        self.mode = crate::app::Mode::Compose(Box::new(c));
+    }
+
     fn open_event_form(&mut self, existing: Option<Occurrence>) {
         let today = calendar::today();
         let (draft, form, title) = match existing {

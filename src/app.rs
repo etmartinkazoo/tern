@@ -1090,6 +1090,7 @@ impl App {
                     KeyCode::Char('c') => self.sync_contacts(),
                     KeyCode::Char('o') => self.mode = Mode::Outbox(0),
                     KeyCode::Char('r') => self.resume_draft(),
+                    KeyCode::Char('e') => self.event_from_message(),
                     _ => {}
                 }
             } else if p == 'z' {
@@ -1520,7 +1521,7 @@ impl App {
     }
 
     /// The open account (in the unified inbox: the selected message's, else the first).
-    fn acct_idx(&self) -> usize {
+    pub fn acct_idx(&self) -> usize {
         match self.current.as_ref() {
             Some((a, _)) if *a == UNIFIED => self.selected().and_then(|e| self.rev.get(&e.uid)).map(|x| x.0).unwrap_or(0),
             Some((a, _)) => *a,
