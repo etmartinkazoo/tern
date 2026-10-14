@@ -166,6 +166,7 @@ pub struct App {
     sending: HashSet<String>,
     pub outbox_count: usize,
     last_outbox: Instant,
+    last_autosave: Instant,
     /// Accounts folded shut in the sidebar, by name; remembered between runs.
     pub collapsed: HashSet<String>,
     /// Where settings are saved; None in demo mode.
@@ -236,6 +237,7 @@ impl App {
             sending: HashSet::new(),
             outbox_count: crate::outbox::list().len(),
             last_outbox: Instant::now(),
+            last_autosave: Instant::now(),
             screen: crate::calview::View::Mail,
             cal: crate::calview::CalState::new(),
             hits: Hits::default(),
@@ -254,6 +256,12 @@ impl App {
     }
 
     pub fn start(&mut self) {
+        if let Some(s) = crate::drafts::load() {
+            let when = chrono::DateTime::from_timestamp(s.saved_at, 0)
+                .map(|d| d.with_timezone(&chrono::Local).format("%a %H:%M").to_string())
+                .unwrap_or_default();
+            self.say(format!("unsent message “{}” from {when} · gr to pick it up", s.draft.subject));
+        }
         self.apply_calendar_config();
         self.apply_timezone();
         self.threaded = self.cfg.ui.threads;
@@ -754,6 +762,7 @@ impl App {
     }
 
     pub fn on_tick(&mut self) {
+        self.autosave_draft();
         if self.last_outbox.elapsed() >= Duration::from_secs(1) {
             self.last_outbox = Instant::now();
             self.pump_outbox();
@@ -871,6 +880,7 @@ impl App {
                     KeyCode::Char('f') => self.goto_role(Role::Flagged),
                     KeyCode::Char('c') => self.sync_contacts(),
                     KeyCode::Char('o') => self.mode = Mode::Outbox(0),
+                    KeyCode::Char('r') => self.resume_draft(),
                     _ => {}
                 }
             } else if p == 'z' {
@@ -1155,7 +1165,7 @@ impl App {
                 }
             }
             Focus::List => {
-                if self.selected().is_some() {
+                if self.selected().is_some() && !self.edit_server_draft() {
                     self.focus = Focus::Body
                 }
             }
@@ -2377,6 +2387,7 @@ impl App {
             }
             Outcome::Discard => {
                 self.mode = Mode::Normal;
+                crate::drafts::clear();
                 self.say("discarded");
             }
             Outcome::SaveDraft => self.save_draft(),
@@ -2414,10 +2425,62 @@ impl App {
                     c.mark_saved();
                 }
                 self.send(a, Cmd::Append { folder: drafts, raw, flags: "(\\Seen \\Draft)" });
+                // The copy this one supersedes goes; later saves only add the new one.
+                if let Mode::Compose(c) = &mut self.mode {
+                    if let Some((ra, rf, ru)) = c.draft.replaces.take() {
+                        self.send(ra, Cmd::Expunge { folder: rf, uids: vec![ru] });
+                    }
+                }
                 self.say("saved to Drafts");
             }
             Err(e) => self.fail(format!("{e:#}")),
         }
+    }
+
+    /// Every couple of seconds while a message is being written, keep a copy on disk.
+    fn autosave_draft(&mut self) {
+        if self.last_autosave.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_autosave = Instant::now();
+        let Mode::Compose(c) = &self.mode else { return };
+        if !c.is_mail() || !c.dirty() {
+            return;
+        }
+        let d = c.to_draft();
+        if d.to.trim().is_empty() && d.subject.trim().is_empty() && d.body.trim().is_empty() {
+            return;
+        }
+        let account = c.from_acct.or(self.current.as_ref().map(|x| x.0)).and_then(|i| self.accts.get(i)).map(|a| a.cfg.name.clone());
+        crate::drafts::save(&crate::drafts::Saved { title: c.title.clone(), account, draft: d, saved_at: crate::outbox::now() });
+    }
+
+    /// gr: pick the autosaved message back up.
+    fn resume_draft(&mut self) {
+        let Some(s) = crate::drafts::load() else {
+            return self.say("no unsent message saved");
+        };
+        let mut c = Composer::new(&s.title, s.draft);
+        c.from_acct = s.account.and_then(|n| self.accts.iter().position(|a| a.cfg.name == n));
+        c.mode = VMode::Normal;
+        self.mode = Mode::Compose(Box::new(c));
+        self.say("picked up where you left off");
+    }
+
+    /// ⏎ on a message in a Drafts folder: continue it in the composer. Sending it
+    /// removes the server copy.
+    fn edit_server_draft(&mut self) -> bool {
+        if !self.current_folder().is_some_and(|f| f.role == Role::Drafts) {
+            return false;
+        }
+        let (Some(b), Some((a, folder))) = (self.body.clone(), self.current.clone()) else { return false };
+        let mut d = compose::draft_from_raw(&b.raw);
+        d.replaces = Some((a, folder, b.uid));
+        let mut c = Composer::new("Draft", d);
+        c.from_acct = Some(a);
+        c.mode = VMode::Normal;
+        self.mode = Mode::Compose(Box::new(c));
+        true
     }
 
     /// Sending puts the message in the outbox (on disk) with a short undo window; the
