@@ -401,7 +401,7 @@ use crate::when::Draft;
 use ical::component::vevent::VEVENT;
 use ical::prop::{
     description::DESCRIPTION, dtend::DTEND, dtstamp::DTSTAMP, dtstart::DTSTART, duration::DURATION,
-    location::LOCATION, sequence::SEQUENCE, summary::SUMMARY,
+    location::LOCATION, sequence::SEQUENCE, summary::SUMMARY, url::URL,
 };
 
 /// Escape a TEXT value (RFC 5545 3.3.11).
@@ -480,6 +480,9 @@ pub fn new_ics(d: &Draft, uid: &str) -> String {
     if !d.description.trim().is_empty() {
         lines.push(format!("DESCRIPTION:{}", esc(d.description.trim_end())));
     }
+    if !d.url.is_empty() {
+        lines.push(format!("URL:{}", d.url));
+    }
     lines.extend(["SEQUENCE:0".into(), "END:VEVENT".into(), "END:VCALENDAR".into()]);
     lines.iter().map(|l| fold(l)).collect::<Vec<_>>().join("\r\n") + "\r\n"
 }
@@ -525,6 +528,7 @@ pub fn draft_of(ics: &str) -> Option<Draft> {
         days: if all_day { end.map(|e| (e.date_naive() - start.date_naive()).num_days().max(1)).unwrap_or(1) } else { 1 },
         location: p.location,
         description: p.description,
+        url: p.url,
     })
 }
 
@@ -549,6 +553,9 @@ pub fn edit_ics(ics: &str, d: &Draft) -> anyhow::Result<String> {
     ev.remove::<SUMMARY>().remove::<LOCATION>().remove::<DESCRIPTION>();
     ev.remove::<DTSTART>().remove::<DTEND>().remove::<DURATION>();
     ev.remove::<SEQUENCE>().remove::<DTSTAMP>();
+    if !d.url.is_empty() {
+        ev.remove::<URL>();
+    }
     let mut push = |line: String| -> anyhow::Result<()> {
         ev.push_raw(&line).map_err(|e| anyhow::anyhow!("writing {line}: {e}"))?;
         Ok(())
@@ -562,6 +569,9 @@ pub fn edit_ics(ics: &str, d: &Draft) -> anyhow::Result<String> {
     }
     if !d.description.trim().is_empty() {
         push(format!("DESCRIPTION:{}", esc(d.description.trim_end())))?;
+    }
+    if !d.url.is_empty() {
+        push(format!("URL:{}", d.url))?;
     }
     push(format!("SEQUENCE:{}", seq + 1))?;
     Ok(cst.to_string())
@@ -581,6 +591,7 @@ mod write_tests {
             days: 1,
             location: "Osteria".into(),
             description: String::new(),
+            url: String::new(),
         }
     }
 

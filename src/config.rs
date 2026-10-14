@@ -211,6 +211,12 @@ pub struct Ui {
     /// Calendar times are shown and entered in this zone (IANA name or est/pst/…).
     #[serde(default = "calendar_timezone")]
     pub calendar_timezone: String,
+    /// Your personal Zoom meeting link, put on events with `gz`.
+    #[serde(default)]
+    pub zoom_link: Option<String>,
+    /// The Google account `gm` creates Meet links with (default: the first Google one).
+    #[serde(default)]
+    pub meet_account: Option<String>,
     /// Where new events and accepted invitations go: "<source>/<calendar id>".
     #[serde(default)]
     pub default_calendar: Option<String>,

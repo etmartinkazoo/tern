@@ -86,6 +86,7 @@ pub const KEYMAP: &[Section] = &[
             ("a", "quick add: Lunch fri 12:30 1h @place"),
             ("A e", "new event / edit in the form"),
             ("d", "delete (asks first)"),
+            ("gm gz", "add a Google Meet / Zoom link to the event"),
             ("space", "show / hide a calendar (sidebar)"),
             ("/", "filter events"),
             ("o", "open the event's link"),
@@ -128,6 +129,7 @@ pub const KEYMAP: &[Section] = &[
             (":a <file> ^t", "attach"),
             (":e ^e", "edit in $EDITOR, then come back"),
             (":to :cc :bcc", "jump to a field"),
+            (":meet :zoom", "event form: put a call link in Where"),
         ],
     },
     Section {

@@ -10,6 +10,7 @@ mod contacts;
 mod dav;
 mod demo;
 mod imap;
+mod meet;
 mod model;
 mod oauth;
 mod keys;

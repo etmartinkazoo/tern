@@ -4,12 +4,24 @@
 use crate::app::{Action, App, Focus};
 use crate::calendar::{self, Occurrence};
 use crate::dav::CachedCalendar;
+use crate::composer::Call;
 use crate::model::Event;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone};
 use chrono_tz::Tz;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashSet;
 use std::time::Instant;
+
+/// Where a call link goes once it exists.
+#[derive(Debug, Clone)]
+pub enum CallTarget {
+    /// An event already in a calendar.
+    Event { calendar: usize, item: String },
+    /// A quick-add event waiting for its link.
+    New { calendar: usize, draft: crate::when::Draft },
+    /// The open event form's Where field.
+    Form,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -499,6 +511,13 @@ impl App {
                 self.cal.step(1);
                 self.cal.step(-1);
             }
+            (_, KeyCode::Char(c @ ('m' | 'z'))) if g => {
+                let call = if c == 'm' { Call::Meet } else { Call::Zoom };
+                match self.cal.selected().cloned() {
+                    Some(o) => self.add_call(call, CallTarget::Event { calendar: o.calendar, item: o.item }),
+                    None => self.say("select an event first"),
+                }
+            }
             (_, KeyCode::Char('g')) => self.cal.pending_g = true,
             (_, KeyCode::Char('G')) => {
                 self.cal.cursor = self.cal.rows.len().saturating_sub(1);
@@ -556,13 +575,9 @@ impl App {
                     return self.say_error("no calendar to add to — sync first ($)");
                 };
                 let d = crate::when::Draft {
-                    title: String::new(),
                     date: if self.cal.rows.is_empty() { today } else { self.cal.cursor_day() },
-                    start: None,
-                    end: None,
                     days: 1,
-                    location: String::new(),
-                    description: String::new(),
+                    ..Default::default()
                 };
                 (d, crate::composer::EventForm { calendar: cal, item: None }, "New event")
             }
@@ -580,7 +595,67 @@ impl App {
             return self.say_error("couldn't find a title in that");
         };
         let Some(cal) = self.cal.target() else { return };
-        self.write_event(cal, None, d);
+        // "@meet" / "@zoom" as the place: make the call link, then add the event.
+        match d.location.to_lowercase().as_str() {
+            "meet" | "google meet" => self.add_call(Call::Meet, CallTarget::New { calendar: cal, draft: d }),
+            "zoom" => self.add_call(Call::Zoom, CallTarget::New { calendar: cal, draft: d }),
+            _ => self.write_event(cal, None, d),
+        }
+    }
+
+    /// Make a call link and put it on `target`. Zoom is your fixed room; Meet asks
+    /// Google for a new space, so it arrives later as an event.
+    pub fn add_call(&mut self, call: Call, target: CallTarget) {
+        match call {
+            Call::Zoom => match crate::meet::zoom(&self.cfg) {
+                Ok(link) => self.on_call_link(Ok(link), target),
+                Err(e) => self.say_error(format!("{e:#}")),
+            },
+            Call::Meet => {
+                if self.demo {
+                    let link = "https://meet.google.com/abc-defg-hij".to_string();
+                    return self.on_call_link(Ok(link), target);
+                }
+                self.say("creating a Meet link…");
+                let (cfg, tx) = (self.cfg.clone(), self.events_tx.clone());
+                tokio::spawn(async move {
+                    let r = crate::meet::create_meet(&cfg).await.map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Event::CallLink(r, target));
+                });
+            }
+        }
+    }
+
+    pub fn on_call_link(&mut self, link: Result<String, String>, target: CallTarget) {
+        let link = match link {
+            Ok(l) => l,
+            Err(e) => return self.say_error(e),
+        };
+        let label = if link.contains("zoom.") { "Zoom" } else { "Meet" };
+        match target {
+            CallTarget::Event { calendar, item } => {
+                let Some(ics) = self.cal.calendars.get(calendar).and_then(|c| c.items.get(&item)).cloned() else {
+                    return self.say_error("that event is gone");
+                };
+                let Some(mut d) = calendar::draft_of(&ics) else { return self.say_error("couldn't read that event") };
+                crate::meet::attach(&mut d, &link, label);
+                self.write_event(calendar, Some(item), d);
+            }
+            CallTarget::New { calendar, mut draft } => {
+                crate::meet::attach(&mut draft, &link, label);
+                self.write_event(calendar, None, draft);
+            }
+            CallTarget::Form => {
+                if let crate::app::Mode::Compose(c) = &mut self.mode {
+                    if c.event.is_some() {
+                        c.set_field(4, &link);
+                        self.say(format!("{label} link added — ^s saves"));
+                        return;
+                    }
+                }
+                self.say(format!("{label} link: {link}"));
+            }
+        }
     }
 
     pub fn save_event(&mut self, c: Box<crate::composer::Composer>) {

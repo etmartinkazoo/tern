@@ -4,7 +4,7 @@
 use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Weekday};
 
 /// An event as typed, before it becomes iCalendar.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Draft {
     pub title: String,
     pub date: NaiveDate,
@@ -15,6 +15,8 @@ pub struct Draft {
     pub days: i64,
     pub location: String,
     pub description: String,
+    /// A link for the event (video call, document): the iCalendar URL property.
+    pub url: String,
 }
 
 const WEEKDAYS: [(&str, Weekday); 7] = [
@@ -251,7 +253,7 @@ pub fn parse_on(input: &str, today: NaiveDate, default: NaiveDate) -> Option<Dra
         (Some(s), Some(end.unwrap_or_else(|| s + length.unwrap_or(Duration::hours(1)))))
     };
     let days = if start.is_none() { length.map(|l| (l.num_hours() / 24).max(1)).unwrap_or(1) } else { 1 };
-    Some(Draft { title, date, start, end, days, location, description: String::new() })
+    Some(Draft { title, date, start, end, days, location, ..Default::default() })
 }
 
 #[cfg(test)]

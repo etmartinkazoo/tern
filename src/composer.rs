@@ -42,6 +42,12 @@ pub enum VMode {
     Visual,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Call {
+    Meet,
+    Zoom,
+}
+
 /// What the app should do after a key.
 pub enum Outcome {
     None,
@@ -50,6 +56,8 @@ pub enum Outcome {
     Discard,
     Attach,
     External,
+    /// `:meet` / `:zoom`: put a call link on this event.
+    Call(Call),
     Say(String),
 }
 
@@ -229,6 +237,15 @@ impl Composer {
         self.event.is_none() && self.account.is_none() && self.source.is_none()
     }
 
+    /// Replace a single-line field's text.
+    pub fn set_field(&mut self, i: usize, text: &str) {
+        if i < self.fields.len() {
+            let mut t = area(text);
+            t.move_cursor(CursorMove::End);
+            self.fields[i] = t;
+        }
+    }
+
     /// Every single-line field's text, in order.
     pub fn values(&self) -> Vec<String> {
         self.fields.iter().map(|f| f.lines().join(" ").trim().to_string()).collect()
@@ -288,6 +305,8 @@ impl Composer {
             start,
             end,
             days,
+            // A link typed (or :meet / :zoom'd) into Where is also the event's URL.
+            url: if f(4).starts_with("http") { f(4) } else { String::new() },
             location: f(4),
             description: self.body.lines().join("\n").trim_end().to_string(),
         })
@@ -430,6 +449,8 @@ impl Composer {
             "q" if self.dirty() => Outcome::Say("unsent changes — :q! to discard, :wq to send".into()),
             "q" | "q!" | "cq" => Outcome::Discard,
             "e" | "edit" => Outcome::External,
+            "meet" if self.event.is_some() => Outcome::Call(Call::Meet),
+            "zoom" if self.event.is_some() => Outcome::Call(Call::Zoom),
             "a" | "attach" if !arg.is_empty() => {
                 let p = crate::theme::expand(arg);
                 if p.is_file() {

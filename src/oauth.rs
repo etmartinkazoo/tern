@@ -37,6 +37,7 @@ pub fn provider(o: &OAuth) -> Result<Provider> {
                 "https://mail.google.com/",
                 "https://www.googleapis.com/auth/calendar",
                 "https://www.googleapis.com/auth/carddav",
+                "https://www.googleapis.com/auth/meetings.space.created",
             ]),
             extras: vec![("access_type", "offline"), ("prompt", "consent")],
             loopback_host: "127.0.0.1",

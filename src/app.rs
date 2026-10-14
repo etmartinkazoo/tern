@@ -710,6 +710,7 @@ impl App {
             }
             Event::Sent(s) => self.say(s),
             Event::Calendars(c, errors) => self.on_calendars(c, errors),
+            Event::CallLink(r, target) => self.on_call_link(r, target),
             Event::CalWrite(r) => {
                 match r {
                     Ok(s) => self.say(s),
@@ -2333,6 +2334,7 @@ impl App {
         }
         match out {
             Outcome::None => {}
+            Outcome::Call(call) => self.add_call(call, crate::calview::CallTarget::Form),
             Outcome::Say(s) => self.say(s),
             Outcome::Send | Outcome::SaveDraft if matches!(&self.mode, Mode::Compose(c) if c.source.is_some()) => {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };

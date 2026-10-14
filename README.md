@@ -163,6 +163,15 @@ with an IANA name or `est`/`cst`/`mst`/`pst`/`utc`; daylight time is handled.
 The agenda opens on today, with earlier days a `k` away. Edits change only the title, times, place and notes, and keep
 everything else in the event (attendees, alarms, time zone) as it was.
 
+**Call links.** `gm` on an event creates a new Google Meet link; `gz` adds your
+personal Zoom link (Settings → General → Zoom link). The link goes into Where
+(if it's empty), the event's URL (`o` opens it) and the top of the notes, and
+the event is saved. In the event form use `:meet` / `:zoom`; in quick add end
+with `@meet` or `@zoom` (`Design review fri 2pm 45m @meet`). Meet uses your
+Google account's OAuth sign-in (or the one named in Meet account). It needs the
+Google Meet REST API enabled in your Cloud project and a fresh `tern auth
+<account>` to grant permission to create meetings.
+
 Meeting invitations show as a card at the top of the message: when, where, who
 is coming, your answer, and anything it overlaps in your calendars. `a` / `t` / `n`
 answer yes / maybe / no. That sends the organizer a standard reply, puts the

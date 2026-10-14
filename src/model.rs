@@ -123,6 +123,8 @@ pub enum Event {
     Sent(String),
     /// Calendars after a sync, and any sources that failed.
     Calendars(Vec<crate::dav::CachedCalendar>, Vec<String>),
+    /// A call link was made (or not) for an event.
+    CallLink(Result<String, String>, crate::calview::CallTarget),
     /// A calendar write finished: what was done, or why it failed.
     CalWrite(Result<String, String>),
     SendFailed(Box<crate::compose::Draft>, String),

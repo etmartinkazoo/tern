@@ -33,6 +33,8 @@ pub const ITEMS: &[Item] = &[
     Item { section: "Reading", label: "Start threads folded", key: "collapse_threads", kind: Kind::Bool, help: "Show each conversation as one row until za unfolds it." },
     Item { section: "Reading", label: "Mark read after", key: "mark_read_ms", kind: Kind::Num { min: 0, max: 10_000, step: 100, unit: "ms" }, help: "How long a message must stay open before it counts as read. 0 marks it at once." },
     Item { section: "Calendar", label: "Time zone", key: "calendar_timezone", kind: Kind::Text, help: "Calendar times are shown and entered in this zone. An IANA name (America/New_York, Europe/Berlin) or est, cst, mst, pst, utc; daylight time is handled." },
+    Item { section: "Calendar", label: "Zoom link", key: "zoom_link", kind: Kind::Text, help: "Your Personal Meeting Room link (zoom.us/j/…). gz puts it on the selected event; :zoom in the event form, @zoom in quick add." },
+    Item { section: "Calendar", label: "Meet account", key: "meet_account", kind: Kind::Text, help: "The Google account gm creates Meet links with. Empty means the first account signing in with Google OAuth." },
     Item { section: "Layout", label: "Sidebar width", key: "sidebar_width", kind: Kind::Num { min: 12, max: 60, step: 2, unit: "cols" }, help: "Width of the folder column." },
     Item { section: "Layout", label: "Message list width", key: "list_percent", kind: Kind::Num { min: 20, max: 80, step: 5, unit: "%" }, help: "Share of the remaining width given to the list; the message gets the rest." },
     Item { section: "Layout", label: "Nerd Font icons", key: "icons", kind: Kind::Bool, help: "Folder and flag glyphs. Omarchy ships JetBrainsMono Nerd Font." },
@@ -78,6 +80,8 @@ pub fn get(ui: &Ui, key: &str) -> String {
         "mouse" => ui.mouse.to_string(),
         "date_format" => ui.date_format.clone(),
         "calendar_timezone" => ui.calendar_timezone.clone(),
+        "zoom_link" => ui.zoom_link.clone().unwrap_or_default(),
+        "meet_account" => ui.meet_account.clone().unwrap_or_default(),
         "download_dir" => tilde(&ui.download_dir),
         "editor" => ui.editor.clone().unwrap_or_default(),
         _ => String::new(),
@@ -136,6 +140,13 @@ pub fn set(ui: &mut Ui, item: &Item, raw: &str) -> Result<toml_edit::Item> {
                     return Ok(toml_edit::value(tz.name()));
                 }
                 "editor" => ui.editor = (!raw.is_empty()).then(|| raw.to_string()),
+                "zoom_link" => {
+                    if !raw.is_empty() && !raw.starts_with("https://") {
+                        bail!("the Zoom link should start with https://");
+                    }
+                    ui.zoom_link = (!raw.is_empty()).then(|| raw.to_string())
+                }
+                "meet_account" => ui.meet_account = (!raw.is_empty()).then(|| raw.to_string()),
                 _ => bail!("unknown setting"),
             }
             if raw.is_empty() {
