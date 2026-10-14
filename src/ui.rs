@@ -499,8 +499,9 @@ fn human_size(n: usize) -> String {
 fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let from = app.accts.get(app.compose_acct()).map(|a| a.cfg.sender_mailbox()).unwrap_or_default();
     let active = matches!(app.mode, Mode::Compose(_));
+    let switchable = app.accts.len() > 1;
     if let Some(c) = app.composer_mut() {
-        return draw_composer(f, c, active, &from, r, t);
+        return draw_composer_with(f, c, active, &from, switchable, r, t);
     }
     if app.conv_thread().is_some() {
         return draw_conversation(f, app, r, t);
@@ -927,6 +928,10 @@ fn draw_soft_wrapped(f: &mut Frame, c: &mut Composer, area: Rect, cur_st: Style,
 }
 
 fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: Rect, t: &Theme) {
+    draw_composer_with(f, c, active, from, false, r, t)
+}
+
+fn draw_composer_with(f: &mut Frame, c: &mut Composer, active: bool, from: &str, switchable: bool, r: Rect, t: &Theme) {
     let w = r.width as usize;
     let label_w = (c.labels.iter().map(|l| l.width()).max().unwrap_or(7) + 3).max(9) as u16;
     let (mode_txt, mode_c) = match c.mode {
@@ -947,7 +952,11 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
     f.render_widget(Paragraph::new(Line::from(head)), row(y));
     y += 1;
     if c.is_mail() {
-        f.render_widget(Paragraph::new(header_line("From", from, w, t)), row(y));
+        let mut l = header_line("From", from, w.saturating_sub(12), t);
+        if switchable {
+            l.spans.push(Span::styled("   ^f switch", Style::default().fg(t.subtle)));
+        }
+        f.render_widget(Paragraph::new(l), row(y));
         y += 1;
     }
     if !c.note.is_empty() {

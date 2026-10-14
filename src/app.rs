@@ -343,10 +343,6 @@ impl App {
         self.view.get(self.cursor).and_then(|&i| self.all.get(i))
     }
 
-    fn selected_mut(&mut self) -> Option<&mut Envelope> {
-        let i = *self.view.get(self.cursor)?;
-        self.all.get_mut(i)
-    }
 
     /// The marked messages, or what is under the cursor: a folded conversation counts as
     /// all of its messages.
@@ -423,14 +419,6 @@ impl App {
         out
     }
 
-    /// The account the selected message belongs to (the open account outside the
-    /// unified inbox).
-    fn msg_acct(&self) -> usize {
-        match self.selected().and_then(|e| self.real(e.uid)) {
-            Some((a, _, _)) => a,
-            None => self.acct_idx(),
-        }
-    }
 
     /// The row showing `uid`, or the folded conversation that contains it.
     fn row_of(&self, uid: u32) -> Option<usize> {
@@ -2483,7 +2471,28 @@ impl App {
     }
 
     fn compose(&mut self, title: &str, d: Draft) {
-        self.mode = Mode::Compose(Box::new(Composer::new(title, d)));
+        // A reply starts from the account the message came to; anything else from
+        // the account you're looking at.
+        let from = d.source.as_ref().map(|s| s.0).unwrap_or_else(|| self.acct_idx());
+        let mut c = Composer::new(title, d);
+        c.from_acct = Some(from);
+        self.mode = Mode::Compose(Box::new(c));
+    }
+
+    /// ^f in the composer: the next account sends it, with its signature.
+    fn cycle_from(&mut self) {
+        let n = self.accts.len();
+        if n < 2 {
+            return self.say("only one account to send from");
+        }
+        let sigs: Vec<Option<String>> = self.accts.iter().map(|a| a.cfg.signature.clone()).collect();
+        let names: Vec<String> = self.accts.iter().map(|a| a.cfg.sender_mailbox()).collect();
+        let cur = self.compose_acct();
+        let Mode::Compose(c) = &mut self.mode else { return };
+        let next = (cur + 1) % n;
+        c.swap_signature(sigs[cur].as_deref(), sigs[next].as_deref());
+        c.from_acct = Some(next);
+        self.say(format!("from {}", names[next]));
     }
 
     /// Back from the external editor: fold its text into the composer that sent us there.
@@ -2526,6 +2535,7 @@ impl App {
         match out {
             Outcome::None => {}
             Outcome::Call(call) => self.add_call(call, crate::calview::CallTarget::Form),
+            Outcome::CycleFrom => self.cycle_from(),
             Outcome::Say(s) => self.say(s),
             Outcome::Send | Outcome::SaveDraft if matches!(&self.mode, Mode::Compose(c) if c.source.is_some()) => {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };

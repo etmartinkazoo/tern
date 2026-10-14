@@ -109,6 +109,7 @@ pub const KEYMAP: &[Section] = &[
             ("esc", "normal mode"),
             ("^s", "send"),
             ("^t", "attach a file"),
+            ("^f", "send from the next account (signature follows)"),
         ],
     },
     Section {

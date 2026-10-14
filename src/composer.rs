@@ -56,6 +56,8 @@ pub enum Outcome {
     Discard,
     Attach,
     External,
+    /// ^f: send from the next account.
+    CycleFrom,
     /// `:meet` / `:zoom`: put a call link on this event.
     Call(Call),
     Say(String),
@@ -256,6 +258,20 @@ impl Composer {
         self.fields.iter().map(|f| f.lines().join(" ").trim().to_string()).collect()
     }
 
+    /// Swap one signature for another in the body, wherever the old one sits.
+    pub fn swap_signature(&mut self, old: Option<&str>, new: Option<&str>) {
+        let text = self.body.lines().join("\n");
+        let replaced = match (old.filter(|s| !s.is_empty()), new) {
+            (Some(o), n) if text.contains(o) => text.replacen(o, n.unwrap_or(""), 1),
+            (None, Some(n)) if !n.is_empty() && !text.contains(n) => format!("{}\n\n{n}", text.trim_end()),
+            _ => return,
+        };
+        let (row, col) = self.body.cursor();
+        let mut t = area(&replaced);
+        t.move_cursor(CursorMove::Jump(row as u16, col as u16));
+        self.body = t;
+    }
+
     pub fn body_text(&self) -> String {
         self.body.lines().join("\n").trim_end().to_string()
     }
@@ -419,6 +435,7 @@ impl Composer {
             match k.code {
                 KeyCode::Char('s') => return Outcome::Send,
                 KeyCode::Char('t') => return Outcome::Attach,
+                KeyCode::Char('f') if self.is_mail() => return Outcome::CycleFrom,
                 KeyCode::Char('e') if self.mode != VMode::Insert => return Outcome::External,
                 _ => {}
             }
@@ -918,6 +935,15 @@ mod tests {
         assert!(matches!(c.key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE)), Outcome::None));
         assert!(matches!(c.key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE)), Outcome::Discard));
         assert_eq!(c.to_draft().body, "helloworld\n");
+    }
+
+    #[test]
+    fn signature_swaps() {
+        let mut c = new("Hi\n\n-- \nTed (personal)");
+        c.swap_signature(Some("-- \nTed (personal)"), Some("-- \nTed Martin · Lumin"));
+        assert_eq!(c.body.lines().join("\n"), "Hi\n\n-- \nTed Martin · Lumin");
+        c.swap_signature(Some("-- \nTed Martin · Lumin"), None);
+        assert_eq!(c.body.lines().join("\n").trim_end(), "Hi");
     }
 
     #[test]
