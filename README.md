@@ -1,6 +1,7 @@
 # tern
 
 A dense, vim-driven mail client for the terminal that wears your Omarchy theme.
+Website and docs: **https://ternmail.dev**
 
 ```
  tern you@x.com         │ Inbox  412 · 6 unread                  │ Re: Q4 roadmap — final cut before Friday
@@ -39,7 +40,7 @@ itself is the interface.
 ## Run it
 
 ```sh
-cargo install --path .     # or: cargo build --release
+cargo install --git https://github.com/etmartinkazoo/tern   # or, in a checkout: cargo install --path .
 tern --demo                # look around with a fake mailbox
 tern --init                # writes ~/.config/tern/config.toml
 tern doctor                # check every account and server
