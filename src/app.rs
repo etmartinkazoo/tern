@@ -1,7 +1,7 @@
 //! Application state and the vim-style keymap.
 
 use crate::compose::{self, Draft, Kind};
-use crate::composer::{self, Composer, Outcome, VMode};
+use crate::composer::{Composer, Outcome, VMode};
 use crate::config::{Account, Config};
 use crate::contacts::{self, Contact};
 use crate::model::{Body, Cmd, Envelope, Event, Folder, Role};
@@ -26,6 +26,8 @@ pub enum Focus {
 pub enum PromptKind {
     Filter,
     CalFilter,
+    QuickAdd,
+    ConfirmDelete,
     Move,
     Attach,
 }
@@ -689,6 +691,15 @@ impl App {
             }
             Event::Sent(s) => self.say(s),
             Event::Calendars(c, errors) => self.on_calendars(c, errors),
+            Event::CalWrite(r) => {
+                match r {
+                    Ok(s) => self.say(s),
+                    Err(e) => self.say_error(e),
+                }
+                // Either way, the server is the truth: resync.
+                self.cal.syncing = false;
+                self.sync_calendars();
+            }
             Event::SendFailed(d, e) => {
                 // Put the draft back on screen so nothing is lost; y retries.
                 self.compose("Retry", *d);
@@ -1356,7 +1367,7 @@ impl App {
         let c = match kind {
             PromptKind::Move => self.folder_completions(&input),
             PromptKind::Attach => Self::path_completions(&input),
-            PromptKind::Filter | PromptKind::CalFilter => vec![],
+            PromptKind::Filter | PromptKind::CalFilter | PromptKind::QuickAdd | PromptKind::ConfirmDelete => vec![],
         };
         if let Mode::Prompt(p) = &mut self.mode {
             p.sel = match kind {
@@ -1370,6 +1381,15 @@ impl App {
     fn prompt_key(&mut self, k: KeyEvent) {
         let Mode::Prompt(p) = &mut self.mode else { return };
         let kind = p.kind;
+        if kind == PromptKind::ConfirmDelete {
+            self.mode = Mode::Normal;
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.delete_event();
+            } else {
+                self.say("kept");
+            }
+            return;
+        }
         if k.code == KeyCode::Esc {
             let prev = std::mem::replace(&mut self.mode, Mode::Normal);
             if kind == PromptKind::Filter {
@@ -1477,6 +1497,8 @@ impl App {
                 }
             }
             PromptKind::CalFilter => self.cal_filter(&p.input),
+            PromptKind::QuickAdd => self.quick_add(&p.input),
+            PromptKind::ConfirmDelete => {}
             PromptKind::Move => {
                 let to = picked.unwrap_or_else(|| p.input.trim().to_string());
                 if !to.is_empty() {
@@ -1542,7 +1564,7 @@ impl App {
         }
         if let Mode::Compose(c) = &mut self.mode {
             let k = if d > 0 { KeyCode::Down } else { KeyCode::Up };
-            if c.focus == composer::BODY && c.mode != VMode::Insert {
+            if c.on_body() && c.mode != VMode::Insert {
                 for _ in 0..3 {
                     c.key(KeyEvent::new(k, KeyModifiers::NONE));
                 }
@@ -1792,7 +1814,7 @@ impl App {
                 d.update_from_text(&t);
                 let title = c.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Message".into());
                 let mut n = Composer::new(&title, d);
-                n.focus = composer::BODY;
+                n.focus = n.fields.len();
                 n.mode = VMode::Normal;
                 c = Some(Box::new(n));
             }
@@ -1823,6 +1845,13 @@ impl App {
         match out {
             Outcome::None => {}
             Outcome::Say(s) => self.say(s),
+            Outcome::Send | Outcome::SaveDraft if matches!(&self.mode, Mode::Compose(c) if c.event.is_some()) => {
+                let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
+                self.save_event(c);
+            }
+            Outcome::Attach | Outcome::External if matches!(&self.mode, Mode::Compose(c) if c.event.is_some()) => {
+                self.say("not available for events");
+            }
             Outcome::Send => {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
                 self.send_draft(c);

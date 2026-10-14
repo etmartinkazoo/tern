@@ -807,8 +807,10 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
     let row = |y: u16| Rect { x: r.x, y, width: r.width, height: 1 };
     f.render_widget(Paragraph::new(Line::from(head)), row(y));
     y += 1;
-    f.render_widget(Paragraph::new(header_line("From", from, w, t)), row(y));
-    y += 1;
+    if c.event.is_none() {
+        f.render_widget(Paragraph::new(header_line("From", from, w, t)), row(y));
+        y += 1;
+    }
 
     let field_style = Style::default().fg(t.fg);
     let cursor_style = |focused: bool| {
@@ -821,25 +823,23 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
         }
     };
     let mut focus_row = y;
-    for i in 0..4 {
+    for i in 0..c.fields.len() {
         // Bcc stays out of the way until it has something or you go to it.
-        if i == composer::BCC && c.focus != i && c.fields[i].is_empty() {
+        if c.event.is_none() && i == composer::BCC && c.focus != i && c.fields[i].is_empty() {
             continue;
         }
         let focused = c.focus == i;
         let label_c = if focused && active { t.accent } else { t.subtle };
         f.render_widget(
-            Paragraph::new(Span::styled(format!(" {:<8}", composer::LABELS[i]), Style::default().fg(label_c))),
+            Paragraph::new(Span::styled(format!(" {:<8}", c.labels[i]), Style::default().fg(label_c))),
             Rect { width: label_w, ..row(y) },
         );
         let ta = &mut c.fields[i];
         ta.set_style(field_style);
         ta.set_cursor_style(cursor_style(focused));
         ta.set_selection_style(Style::default().bg(t.sel_bg));
-        if i < composer::SUBJECT {
-            ta.set_placeholder_text(if i == composer::TO { "name or address — tab completes" } else { "" });
-            ta.set_placeholder_style(Style::default().fg(t.subtle));
-        }
+        ta.set_placeholder_text(c.placeholders.get(i).copied().unwrap_or(""));
+        ta.set_placeholder_style(Style::default().fg(t.subtle));
         f.render_widget(&*ta, Rect { x: r.x + label_w, y, width: r.width.saturating_sub(label_w + 1), height: 1 });
         if focused {
             focus_row = y;
@@ -873,7 +873,7 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
     // Body, then a one-line key hint at the bottom.
     let bottom = r.y + r.height;
     let body_h = bottom.saturating_sub(y + 1);
-    let body_focused = c.focus == composer::BODY;
+    let body_focused = c.on_body();
     let cur_st = cursor_style(body_focused);
     draw_soft_wrapped(f, c, Rect { x: r.x + 1, y, width: r.width.saturating_sub(2), height: body_h }, cur_st, active && body_focused, t);
 
@@ -881,7 +881,12 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
         vec![Span::styled(k.to_string(), Style::default().fg(t.yellow)), Span::styled(format!(" {label}  "), Style::default().fg(t.subtle))]
     };
     let mut hint = vec![Span::raw(" ")];
-    for (k, l) in [("^s", "send"), ("^t", "attach"), (":w", "draft"), (":q!", "discard"), (":e", "$EDITOR")] {
+    let keys: &[(&str, &str)] = if c.event.is_some() {
+        &[("^s ZZ", "save"), (":q!", "discard"), ("tab", "next field")]
+    } else {
+        &[("^s", "send"), ("^t", "attach"), (":w", "draft"), (":q!", "discard"), (":e", "$EDITOR")]
+    };
+    for (k, l) in keys.iter().copied() {
         hint.extend(key(k, l));
     }
     f.render_widget(Paragraph::new(Line::from(hint)), row(bottom.saturating_sub(1)));
@@ -920,6 +925,8 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
         },
         Mode::Prompt(p) => match p.kind {
             PromptKind::Filter | PromptKind::CalFilter => ("SEARCH", t.yellow),
+            PromptKind::QuickAdd => ("ADD", t.green),
+            PromptKind::ConfirmDelete => ("DELETE?", t.red),
             PromptKind::Move => ("MOVE", t.magenta),
             PromptKind::Attach => ("ATTACH", t.yellow),
         },
@@ -945,6 +952,8 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
     if let Mode::Prompt(p) = &app.mode {
         let label = match p.kind {
             PromptKind::Filter | PromptKind::CalFilter => " /",
+            PromptKind::QuickAdd => " add:",
+            PromptKind::ConfirmDelete => "",
             PromptKind::Move => " move to:",
             PromptKind::Attach => " file:",
         };
@@ -954,6 +963,8 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
         let hint = match p.kind {
             PromptKind::Filter => "  enter: also search server · esc: clear",
             PromptKind::CalFilter => "  filters events as you type · esc: clear",
+            PromptKind::QuickAdd => "  e.g. Lunch with Maya fri 12:30 1h @Osteria · enter adds",
+            PromptKind::ConfirmDelete => "  y deletes · anything else keeps it",
             PromptKind::Move | PromptKind::Attach => "  tab: complete · ↑↓ pick · enter: ok",
         };
         spans.push(Span::styled(hint, Style::default().fg(t.subtle)));
@@ -1215,6 +1226,10 @@ fn draw_agenda(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
 }
 
 fn draw_event(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
+    let active = matches!(app.mode, Mode::Compose(_));
+    if let Some(c) = app.composer_mut() {
+        return draw_composer(f, c, active, "", r, t);
+    }
     let focused = app.focus == Focus::Body;
     let w = r.width as usize;
     let Some(o) = app.cal.selected().cloned() else {

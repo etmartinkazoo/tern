@@ -17,6 +17,7 @@ mod settings;
 mod theme;
 mod thread;
 mod ui;
+mod when;
 
 use anyhow::{Context, Result};
 use app::{AcctState, Action, App};

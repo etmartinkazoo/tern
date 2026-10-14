@@ -17,6 +17,8 @@ use ical::value::IcalValue;
 #[derive(Debug, Clone)]
 pub struct Occurrence {
     pub calendar: usize,
+    /// The CalDAV resource the event lives in.
+    pub item: String,
     pub uid: String,
     pub summary: String,
     pub location: String,
@@ -188,7 +190,7 @@ fn to_local(t: IcalRecurDateTime, zone: &IcalRecurZone, zones: &[IcalTz]) -> Opt
 }
 
 /// Every occurrence of the events in one iCalendar object that overlaps `from..to`.
-pub fn expand(ics: &str, calendar: usize, from: DateTime<Local>, to: DateTime<Local>) -> Vec<Occurrence> {
+pub fn expand(ics: &str, item: &str, calendar: usize, from: DateTime<Local>, to: DateTime<Local>) -> Vec<Occurrence> {
     let Ok(cst) = IcalCst::parse(ics) else { return vec![] };
     let cal = cst.decode();
     let comps = &cal.components;
@@ -249,6 +251,7 @@ pub fn expand(ics: &str, calendar: usize, from: DateTime<Local>, to: DateTime<Lo
             }
             out.push(Occurrence {
                 calendar,
+                item: item.to_string(),
                 uid: mp.uid.clone(),
                 summary: if p.summary.is_empty() { "(no title)".into() } else { p.summary.clone() },
                 location: p.location.clone(),
@@ -282,7 +285,7 @@ DTEND:20260126T150000\r\nSUMMARY:Standup (afternoon)\r\nEND:VEVENT\r\nEND:VCALEN
 
     #[test]
     fn expands_rules_exdates_and_overrides() {
-        let o = expand(WEEKLY, 0, local(2026, 1, 1, 0, 0), local(2026, 3, 1, 0, 0));
+        let o = expand(WEEKLY, "i", 0, local(2026, 1, 1, 0, 0), local(2026, 3, 1, 0, 0));
         let days: Vec<String> = o.iter().map(|o| o.start.format("%m-%d %H:%M").to_string()).collect();
         // Five Mondays, minus the 19th, with the 26th moved to the afternoon.
         assert_eq!(days, ["01-05 09:00", "01-12 09:00", "01-26 14:00", "02-02 09:00"]);
@@ -297,11 +300,11 @@ DTEND:20260126T150000\r\nSUMMARY:Standup (afternoon)\r\nEND:VEVENT\r\nEND:VCALEN
     fn window_and_all_day() {
         let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTAMP:20260101T000000Z\r\n\
 DTSTART;VALUE=DATE:20260310\r\nDTEND;VALUE=DATE:20260312\r\nSUMMARY:Offsite\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let o = expand(ics, 0, local(2026, 3, 11, 0, 0), local(2026, 3, 20, 0, 0));
+        let o = expand(ics, "i", 0, local(2026, 3, 11, 0, 0), local(2026, 3, 20, 0, 0));
         assert_eq!(o.len(), 1);
         assert!(o[0].all_day);
         assert_eq!((o[0].end - o[0].start).num_days(), 2);
-        assert!(expand(ics, 0, local(2026, 4, 1, 0, 0), local(2026, 5, 1, 0, 0)).is_empty());
+        assert!(expand(ics, "i", 0, local(2026, 4, 1, 0, 0), local(2026, 5, 1, 0, 0)).is_empty());
     }
 
     #[test]
@@ -309,7 +312,7 @@ DTSTART;VALUE=DATE:20260310\r\nDTEND;VALUE=DATE:20260312\r\nSUMMARY:Offsite\r\nE
         let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:z\r\nDTSTAMP:20260101T000000Z\r\n\
 DTSTART;TZID=America/New_York:20260715T120000\r\nDURATION:PT45M\r\nSUMMARY:Call\r\nEND:VEVENT\r\n\
 BEGIN:VEVENT\r\nUID:u\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T160000Z\r\nSUMMARY:Same instant\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let o = expand(ics, 0, local(2026, 7, 1, 0, 0), local(2026, 8, 1, 0, 0));
+        let o = expand(ics, "i", 0, local(2026, 7, 1, 0, 0), local(2026, 8, 1, 0, 0));
         assert_eq!(o.len(), 2);
         // Noon in New York in July is 16:00 UTC.
         assert_eq!(o[0].start, o[1].start);
@@ -322,5 +325,222 @@ BEGIN:VEVENT\r\nUID:u\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T160000Z\r\
         assert_eq!(duration_secs("P1D"), Some(86400));
         assert_eq!(duration_secs("-PT15M"), Some(-900));
         assert_eq!(duration_secs("P1W"), Some(604800));
+    }
+}
+
+// ------------------------------------------------------------------- writing
+
+use crate::when::Draft;
+use ical::component::vevent::VEVENT;
+use ical::prop::{
+    description::DESCRIPTION, dtend::DTEND, dtstamp::DTSTAMP, dtstart::DTSTART, duration::DURATION,
+    location::LOCATION, sequence::SEQUENCE, summary::SUMMARY,
+};
+
+/// Escape a TEXT value (RFC 5545 3.3.11).
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace(';', "\\;").replace(',', "\\,").replace('\n', "\\n")
+}
+
+/// Fold a content line at 75 octets without splitting a UTF-8 character.
+fn fold(line: &str) -> String {
+    let mut out = String::new();
+    let mut n = 0;
+    for ch in line.chars() {
+        let w = ch.len_utf8();
+        if n + w > 75 {
+            out.push_str("\r\n ");
+            n = 1;
+        }
+        out.push(ch);
+        n += w;
+    }
+    out
+}
+
+fn stamp() -> String {
+    Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// DTSTART/DTEND lines for a draft. Timed events go out in `tzid` when the series
+/// already lived in a named zone (so DST keeps the wall-clock time), else in UTC.
+fn time_lines(d: &Draft, tzid: Option<&str>) -> (String, String) {
+    match (d.start, d.end) {
+        (Some(s), Some(e)) => {
+            let at = |t: chrono::NaiveTime| -> String {
+                let local = Local.from_local_datetime(&d.date.and_time(t)).earliest().unwrap_or_else(Local::now);
+                match tzid.and_then(|z| z.parse::<chrono_tz::Tz>().ok()) {
+                    Some(tz) => format!(";TZID={}:{}", tz.name(), local.with_timezone(&tz).format("%Y%m%dT%H%M%S")),
+                    None => format!(":{}", local.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ")),
+                }
+            };
+            // An end before the start means it runs past midnight.
+            let end_date_shift = if e <= s { 1 } else { 0 };
+            let end = Draft { date: d.date + Duration::days(end_date_shift), ..d.clone() };
+            let end_at = {
+                let local = Local.from_local_datetime(&end.date.and_time(e)).earliest().unwrap_or_else(Local::now);
+                match tzid.and_then(|z| z.parse::<chrono_tz::Tz>().ok()) {
+                    Some(tz) => format!(";TZID={}:{}", tz.name(), local.with_timezone(&tz).format("%Y%m%dT%H%M%S")),
+                    None => format!(":{}", local.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ")),
+                }
+            };
+            (format!("DTSTART{}", at(s)), format!("DTEND{end_at}"))
+        }
+        _ => (
+            format!("DTSTART;VALUE=DATE:{}", d.date.format("%Y%m%d")),
+            format!("DTEND;VALUE=DATE:{}", (d.date + Duration::days(d.days.max(1))).format("%Y%m%d")),
+        ),
+    }
+}
+
+/// A new event as a complete iCalendar object.
+pub fn new_ics(d: &Draft, uid: &str) -> String {
+    let (start, end) = time_lines(d, None);
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_string(),
+        "VERSION:2.0".into(),
+        "PRODID:-//tern//EN".into(),
+        "BEGIN:VEVENT".into(),
+        format!("UID:{uid}"),
+        format!("DTSTAMP:{}", stamp()),
+        start,
+        end,
+        format!("SUMMARY:{}", esc(&d.title)),
+    ];
+    if !d.location.is_empty() {
+        lines.push(format!("LOCATION:{}", esc(&d.location)));
+    }
+    if !d.description.trim().is_empty() {
+        lines.push(format!("DESCRIPTION:{}", esc(d.description.trim_end())));
+    }
+    lines.extend(["SEQUENCE:0".into(), "END:VEVENT".into(), "END:VCALENDAR".into()]);
+    lines.iter().map(|l| fold(l)).collect::<Vec<_>>().join("\r\n") + "\r\n"
+}
+
+/// The series master (or the only event) of an object, as a draft for the edit form.
+pub fn draft_of(ics: &str) -> Option<Draft> {
+    let cst = IcalCst::parse(ics).ok()?;
+    let cal = cst.decode();
+    let zones: Vec<IcalTz> = cal
+        .components
+        .iter()
+        .filter(|c| kind(c) == Some(IcalComponentKind::VTimezone))
+        .filter_map(IcalTz::of_component)
+        .collect();
+    let master = cal
+        .components
+        .iter()
+        .filter(|c| kind(c) == Some(IcalComponentKind::VEvent))
+        .find(|c| props(c).recurrence_id.is_none())?;
+    let p = props(master);
+    let (sv, stz) = p.start.clone()?;
+    let all_day = sv.trim().len() == 8;
+    let zone_of = |v: &str, tz: &Option<String>| {
+        if v.trim().ends_with(['Z', 'z']) {
+            IcalRecurZone::Utc
+        } else if let Some(t) = tz {
+            IcalRecurZone::Tz(t.clone())
+        } else {
+            IcalRecurZone::Floating
+        }
+    };
+    let start = to_local(civil(&sv)?, &zone_of(&sv, &stz), &zones)?;
+    let end = match (&p.end, &p.duration) {
+        (Some((ev, etz)), _) => civil(ev).and_then(|c| to_local(c, &zone_of(ev, etz), &zones)),
+        (None, Some(d)) => duration_secs(d).map(|s| start + Duration::seconds(s)),
+        _ => None,
+    };
+    Some(Draft {
+        title: p.summary,
+        date: start.date_naive(),
+        start: (!all_day).then(|| start.time()),
+        end: if all_day { None } else { end.map(|e| e.time()) },
+        days: if all_day { end.map(|e| (e.date_naive() - start.date_naive()).num_days().max(1)).unwrap_or(1) } else { 1 },
+        location: p.location,
+        description: p.description,
+    })
+}
+
+/// Apply a draft to an existing object, changing only the series master's title,
+/// times, place and notes. Everything else (attendees, alarms, rules, exceptions,
+/// properties tern doesn't know) is kept byte for byte.
+pub fn edit_ics(ics: &str, d: &Draft) -> anyhow::Result<String> {
+    let mut cst = IcalCst::parse(ics).map_err(|e| anyhow::anyhow!("parsing event: {e}"))?;
+    let tzid = {
+        let cal = cst.decode();
+        cal.components
+            .iter()
+            .filter(|c| kind(c) == Some(IcalComponentKind::VEvent))
+            .find_map(|c| props(c).start.and_then(|(_, tz)| tz))
+    };
+    let ev = cst.component_mut::<VEVENT>().ok_or_else(|| anyhow::anyhow!("no event in object"))?;
+    let seq = ev
+        .prop::<SEQUENCE>()
+        .and_then(|p| p.0.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let (start, end) = time_lines(d, tzid.as_deref());
+    ev.remove::<SUMMARY>().remove::<LOCATION>().remove::<DESCRIPTION>();
+    ev.remove::<DTSTART>().remove::<DTEND>().remove::<DURATION>();
+    ev.remove::<SEQUENCE>().remove::<DTSTAMP>();
+    let mut push = |line: String| -> anyhow::Result<()> {
+        ev.push_raw(&line).map_err(|e| anyhow::anyhow!("writing {line}: {e}"))?;
+        Ok(())
+    };
+    push(format!("DTSTAMP:{}", stamp()))?;
+    push(start)?;
+    push(end)?;
+    push(format!("SUMMARY:{}", esc(&d.title)))?;
+    if !d.location.is_empty() {
+        push(format!("LOCATION:{}", esc(&d.location)))?;
+    }
+    if !d.description.trim().is_empty() {
+        push(format!("DESCRIPTION:{}", esc(d.description.trim_end())))?;
+    }
+    push(format!("SEQUENCE:{}", seq + 1))?;
+    Ok(cst.to_string())
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use chrono::NaiveTime;
+
+    fn draft() -> Draft {
+        Draft {
+            title: "Lunch, with Maya".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+            start: NaiveTime::from_hms_opt(12, 30, 0),
+            end: NaiveTime::from_hms_opt(13, 30, 0),
+            days: 1,
+            location: "Osteria".into(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn new_event_round_trips() {
+        let ics = new_ics(&draft(), "x@tern");
+        let back = draft_of(&ics).unwrap();
+        assert_eq!(back, draft());
+        let o = expand(&ics, "i", 0, Local::now() - Duration::days(3650), Local::now() + Duration::days(3650));
+        assert_eq!(o[0].summary, "Lunch, with Maya");
+    }
+
+    #[test]
+    fn edit_keeps_everything_else() {
+        let orig = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\nBEGIN:VEVENT\r\nUID:k\r\nDTSTAMP:20260101T000000Z\r\n\
+DTSTART;TZID=Europe/Berlin:20261016T090000\r\nDTEND;TZID=Europe/Berlin:20261016T100000\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Old\r\n\
+ATTENDEE;CN=Jo:mailto:jo@x.y\r\nX-CUSTOM:keep me\r\nSEQUENCE:3\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut d = draft_of(orig).unwrap();
+        assert_eq!(d.title, "Old");
+        d.title = "New title".into();
+        let out = edit_ics(orig, &d).unwrap();
+        for keep in ["RRULE:FREQ=WEEKLY", "ATTENDEE;CN=Jo:mailto:jo@x.y", "X-CUSTOM:keep me", "TRIGGER:-PT10M", "PRODID:-//Other//EN"] {
+            assert!(out.contains(keep), "lost {keep}:\n{out}");
+        }
+        assert!(out.contains("SUMMARY:New title") && out.contains("SEQUENCE:4") && !out.contains("SUMMARY:Old"));
+        // The series stays in its own zone, at the same wall-clock time.
+        assert!(out.contains("DTSTART;TZID=Europe/Berlin:20261016T090000"), "{out}");
+        assert_eq!(draft_of(&out).unwrap().start, d.start);
     }
 }

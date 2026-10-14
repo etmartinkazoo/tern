@@ -87,8 +87,8 @@ impl CalState {
             if !self.visible(i) {
                 continue;
             }
-            for ics in c.items.values() {
-                occ.extend(calendar::expand(ics, i, a, b));
+            for (id, ics) in &c.items {
+                occ.extend(calendar::expand(ics, id, i, a, b));
             }
         }
         let q = self.filter.to_lowercase();
@@ -214,6 +214,18 @@ impl CalState {
         self.scroll_into_view();
     }
 
+    /// Where new events go: the calendar under the sidebar cursor, else the selected
+    /// event's, else the first visible one.
+    pub fn target(&self) -> Option<usize> {
+        if let Some(Some(i)) = self.side_rows().get(self.side_cursor) {
+            return Some(*i);
+        }
+        if let Some(o) = self.selected() {
+            return Some(o.calendar);
+        }
+        (0..self.calendars.len()).find(|&i| self.visible(i))
+    }
+
     /// Rows of the sidebar: source headings and calendars.
     pub fn side_rows(&self) -> Vec<Option<usize>> {
         let mut rows = Vec::new();
@@ -316,6 +328,36 @@ impl App {
                 }
             }
             (_, KeyCode::Char('t')) => self.cal.goto_day(Local::now().date_naive()),
+            (_, KeyCode::Char('a')) => match self.cal.target() {
+                Some(i) => {
+                    let name = self.cal.calendars[i].name.clone();
+                    self.mode = crate::app::Mode::Prompt(crate::app::Prompt {
+                        kind: crate::app::PromptKind::QuickAdd,
+                        input: String::new(),
+                        completions: vec![],
+                        sel: None,
+                    });
+                    self.say(format!("adding to {name}"));
+                }
+                None => self.say_error("no calendar to add to — sync first ($)"),
+            },
+            (_, KeyCode::Char('A')) => self.open_event_form(None),
+            (_, KeyCode::Char('e')) => {
+                if let Some(o) = self.cal.selected().cloned() {
+                    self.open_event_form(Some(o));
+                }
+            }
+            (_, KeyCode::Char('d')) if !ctrl => {
+                if let Some(o) = self.cal.selected().cloned() {
+                    let series = if o.recurring { " (the whole series)" } else { "" };
+                    self.mode = crate::app::Mode::Prompt(crate::app::Prompt {
+                        kind: crate::app::PromptKind::ConfirmDelete,
+                        input: format!("delete “{}”{series}?", o.summary),
+                        completions: vec![],
+                        sel: None,
+                    });
+                }
+            }
             (_, KeyCode::Char('/')) => {
                 self.mode = crate::app::Mode::Prompt(crate::app::Prompt {
                     kind: crate::app::PromptKind::CalFilter,
@@ -425,6 +467,115 @@ impl App {
         } else if h.body.contains(at) {
             self.focus = Focus::Body;
         }
+    }
+
+    fn open_event_form(&mut self, existing: Option<Occurrence>) {
+        let today = Local::now().date_naive();
+        let (draft, form, title) = match existing {
+            Some(o) => {
+                let ics = self.cal.calendars[o.calendar].items.get(&o.item).cloned().unwrap_or_default();
+                let Some(d) = calendar::draft_of(&ics) else {
+                    return self.say_error("couldn't read that event");
+                };
+                let title = if o.recurring { "Edit series" } else { "Edit event" };
+                (d, crate::composer::EventForm { calendar: o.calendar, item: Some(o.item.clone()) }, title)
+            }
+            None => {
+                let Some(cal) = self.cal.target() else {
+                    return self.say_error("no calendar to add to — sync first ($)");
+                };
+                let d = crate::when::Draft {
+                    title: String::new(),
+                    date: if self.cal.rows.is_empty() { today } else { self.cal.cursor_day() },
+                    start: None,
+                    end: None,
+                    days: 1,
+                    location: String::new(),
+                    description: String::new(),
+                };
+                (d, crate::composer::EventForm { calendar: cal, item: None }, "New event")
+            }
+        };
+        let name = &self.cal.calendars[form.calendar].name;
+        let title = format!("{title} · {name}");
+        self.mode = crate::app::Mode::Compose(Box::new(crate::composer::Composer::new_event(&title, &draft, form)));
+        self.focus = Focus::Body;
+    }
+
+    pub fn quick_add(&mut self, input: &str) {
+        let today = Local::now().date_naive();
+        let default = if self.cal.rows.is_empty() { today } else { self.cal.cursor_day() };
+        let Some(d) = crate::when::parse_on(input, today, default) else {
+            return self.say_error("couldn't find a title in that");
+        };
+        let Some(cal) = self.cal.target() else { return };
+        self.write_event(cal, None, d);
+    }
+
+    pub fn save_event(&mut self, c: Box<crate::composer::Composer>) {
+        let Some(form) = c.event.clone() else { return };
+        match c.event_draft(Local::now().date_naive()) {
+            Ok(d) => self.write_event(form.calendar, form.item, d),
+            Err(e) => {
+                self.say_error(e);
+                self.mode = crate::app::Mode::Compose(c);
+            }
+        }
+    }
+
+    /// Create (item None) or update an event: show it at once, then write it to the
+    /// server and resync, which either confirms it or puts back what the server has.
+    fn write_event(&mut self, cal: usize, item: Option<String>, d: crate::when::Draft) {
+        let c = &self.cal.calendars[cal];
+        let (ics, id, etag) = match &item {
+            Some(id) => {
+                let orig = c.items.get(id).cloned().unwrap_or_default();
+                match calendar::edit_ics(&orig, &d) {
+                    Ok(ics) => (ics, id.clone(), c.etags.get(id).cloned()),
+                    Err(e) => return self.say_error(format!("{e:#}")),
+                }
+            }
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                (calendar::new_ics(&d, &format!("{id}@tern")), format!("{id}.ics"), None)
+            }
+        };
+        let when = match d.start {
+            Some(s) => format!("{} {}", d.date.format("%a %e %b"), s.format("%H:%M")),
+            None => d.date.format("%a %e %b").to_string(),
+        };
+        let verb = if item.is_some() { "saved" } else { "added" };
+        let done = format!("{verb} “{}” · {when}", d.title);
+        self.cal.calendars[cal].items.insert(id.clone(), ics.clone());
+        self.cal.goto_day(d.date);
+        self.cal.expand();
+        if self.demo {
+            return self.say(format!("{done} (demo: not saved)"));
+        }
+        self.say(format!("{done} · saving…"));
+        let (source, cal_id) = (self.cal.calendars[cal].source.clone(), self.cal.calendars[cal].id.clone());
+        let (cfg, tx) = (self.cfg.clone(), self.events_tx.clone());
+        tokio::spawn(async move {
+            let r = crate::dav::put_event(cfg, source, cal_id, id, ics, etag).await;
+            let _ = tx.send(Event::CalWrite(r.map(|_| done).map_err(|e| format!("{e:#}"))));
+        });
+    }
+
+    pub fn delete_event(&mut self) {
+        let Some(o) = self.cal.selected().cloned() else { return };
+        let c = &self.cal.calendars[o.calendar];
+        let (source, cal_id, etag) = (c.source.clone(), c.id.clone(), c.etags.get(&o.item).cloned());
+        self.cal.calendars[o.calendar].items.remove(&o.item);
+        self.cal.expand();
+        let done = format!("deleted “{}”", o.summary);
+        if self.demo {
+            return self.say(format!("{done} (demo)"));
+        }
+        let (cfg, tx) = (self.cfg.clone(), self.events_tx.clone());
+        tokio::spawn(async move {
+            let r = crate::dav::delete_event(cfg, source, cal_id, o.item, etag).await;
+            let _ = tx.send(Event::CalWrite(r.map(|_| done).map_err(|e| format!("{e:#}"))));
+        });
     }
 
     pub fn toggle_calendar(&mut self, side_row: usize) {

@@ -97,8 +97,13 @@ impl Client {
     }
 }
 
+/// The resource name from an href, percent-decoded so it matches what we PUT.
 fn last_segment(href: &str) -> String {
-    href.trim_end_matches('/').rsplit('/').next().unwrap_or(href).to_string()
+    let seg = href.trim_end_matches('/').rsplit('/').next().unwrap_or(href);
+    url::form_urlencoded::parse(format!("x={}", seg.replace('+', "%2B")).as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_else(|| seg.to_string())
 }
 
 // ------------------------------------------------------------------- contacts
@@ -309,4 +314,41 @@ pub async fn add_contact_to_first(cfg: crate::config::Config, name: String, emai
     let d = cfg.dav_sources().into_iter().next().ok_or_else(|| anyhow!("no [[dav]] source configured"))?;
     let src = resolve(&d, &cfg).await?;
     tokio::task::spawn_blocking(move || add_contact(&src, &name, &email)).await?
+}
+
+// ------------------------------------------------------------------- writing events
+
+/// Create or replace an event. `etag` guards an update against overwriting a change
+/// made elsewhere since the last sync.
+pub async fn put_event(cfg: crate::config::Config, source: String, calendar: String, item: String, ics: String, etag: Option<String>) -> Result<()> {
+    let d = cfg.dav_sources().into_iter().find(|d| d.name == source).ok_or_else(|| anyhow!("no [[dav]] source named {source}"))?;
+    let src = resolve(&d, &cfg).await?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut c = client(&src)?;
+        c.call("calendars", |c| c.calendar_home_set())?;
+        let bytes = ics.into_bytes();
+        match etag {
+            None => {
+                c.call("creating event", |c| c.create_item(&calendar, &item, bytes.clone()))?;
+            }
+            Some(tag) => {
+                c.call("saving event", |c| c.update_item(&calendar, &item, bytes.clone(), Some(&tag)))
+                    .map_err(|e| anyhow!("{e:#} — it may have changed elsewhere; $ to sync, then try again"))?;
+            }
+        }
+        Ok(())
+    })
+    .await?
+}
+
+pub async fn delete_event(cfg: crate::config::Config, source: String, calendar: String, item: String, etag: Option<String>) -> Result<()> {
+    let d = cfg.dav_sources().into_iter().find(|d| d.name == source).ok_or_else(|| anyhow!("no [[dav]] source named {source}"))?;
+    let src = resolve(&d, &cfg).await?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut c = client(&src)?;
+        c.call("calendars", |c| c.calendar_home_set())?;
+        c.call("deleting event", |c| c.delete_item(&calendar, &item, etag.as_deref()))?;
+        Ok(())
+    })
+    .await?
 }

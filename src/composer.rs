@@ -6,12 +6,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_textarea::{CursorMove, Input, TextArea};
 use unicode_width::UnicodeWidthChar;
 
+// Mail field positions.
 pub const TO: usize = 0;
 pub const CC: usize = 1;
 pub const BCC: usize = 2;
 pub const SUBJECT: usize = 3;
-pub const BODY: usize = 4;
-pub const LABELS: [&str; 4] = ["To", "Cc", "Bcc", "Subject"];
+
+/// What an event form is editing: which calendar, and which resource (None = new).
+#[derive(Clone, Debug)]
+pub struct EventForm {
+    pub calendar: usize,
+    pub item: Option<String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VMode {
@@ -34,7 +40,13 @@ pub enum Outcome {
 pub struct Composer {
     pub title: String,
     pub draft: Draft,
-    pub fields: [TextArea<'static>; 4],
+    pub labels: Vec<&'static str>,
+    pub placeholders: Vec<&'static str>,
+    pub fields: Vec<TextArea<'static>>,
+    /// How many leading fields hold addresses (contact completion); 0 for events.
+    addr_fields: usize,
+    /// Set when this form edits a calendar event instead of a message.
+    pub event: Option<EventForm>,
     pub body: TextArea<'static>,
     pub focus: usize,
     pub mode: VMode,
@@ -57,7 +69,7 @@ fn area(text: &str) -> TextArea<'static> {
 
 impl Composer {
     pub fn new(title: &str, draft: Draft) -> Self {
-        let fields = [area(&draft.to), area(&draft.cc), area(&draft.bcc), area(&draft.subject)];
+        let fields = vec![area(&draft.to), area(&draft.cc), area(&draft.bcc), area(&draft.subject)];
         let mut body = area(&draft.body);
         body.move_cursor(CursorMove::Top);
         let focus = if draft.to.trim().is_empty() {
@@ -65,13 +77,17 @@ impl Composer {
         } else if draft.subject.trim().is_empty() {
             SUBJECT
         } else {
-            BODY
+            fields.len()
         };
         let mut c = Composer {
             title: title.to_string(),
             original: String::new(),
             draft,
+            labels: vec!["To", "Cc", "Bcc", "Subject"],
+            placeholders: vec!["name or address — tab completes", "", "", ""],
             fields,
+            addr_fields: 3,
+            event: None,
             body,
             focus,
             mode: VMode::Insert,
@@ -86,6 +102,120 @@ impl Composer {
         }
         c.original = c.snapshot();
         c
+    }
+
+    /// A form for a calendar event, in the same pane with the same keys.
+    pub fn new_event(title: &str, d: &crate::when::Draft, form: EventForm) -> Self {
+        let date = d.date.format("%Y-%m-%d").to_string();
+        let (start, end) = match (d.start, d.end) {
+            (Some(s), Some(e)) => (s.format("%H:%M").to_string(), e.format("%H:%M").to_string()),
+            _ if d.days > 1 => (String::new(), (d.date + chrono::Duration::days(d.days - 1)).format("%Y-%m-%d").to_string()),
+            _ => (String::new(), String::new()),
+        };
+        let fields = vec![area(&d.title), area(&date), area(&start), area(&end), area(&d.location)];
+        let mut body = area(&d.description);
+        body.move_cursor(CursorMove::Top);
+        let mut c = Composer {
+            title: title.to_string(),
+            draft: Draft::default(),
+            labels: vec!["Title", "Date", "Start", "End", "Where"],
+            placeholders: vec![
+                "what",
+                "2026-10-16 · fri · tomorrow · oct 20",
+                "14:00 · 3pm · empty for all day",
+                "15:30 · 1h · or the last day of an all-day event",
+                "",
+            ],
+            fields,
+            addr_fields: 0,
+            event: Some(form),
+            body,
+            focus: 0,
+            mode: if d.title.is_empty() { VMode::Insert } else { VMode::Normal },
+            command: None,
+            pending: None,
+            completions: vec![],
+            sel: None,
+            scroll: 0,
+            original: String::new(),
+        };
+        for f in c.fields.iter_mut() {
+            f.move_cursor(CursorMove::End);
+        }
+        c.original = c.snapshot();
+        c
+    }
+
+    /// Read the event form back. Dates and times accept what quick add accepts.
+    pub fn event_draft(&self, today: chrono::NaiveDate) -> Result<crate::when::Draft, String> {
+        use crate::when;
+        let f = |i: usize| self.fields[i].lines().join(" ").trim().to_string();
+        let title = f(0);
+        if title.is_empty() {
+            return Err("the event needs a title".into());
+        }
+        let date_s = f(1);
+        let words: Vec<&str> = date_s.split_whitespace().collect();
+        let date = if words.is_empty() {
+            today
+        } else {
+            when::date_at(&words, today).map(|(d, _)| d).ok_or_else(|| format!("can't read the date `{date_s}`"))?
+        };
+        let (start_s, end_s) = (f(2), f(3));
+        let start = if start_s.is_empty() {
+            None
+        } else {
+            Some(when::time(&start_s).or_else(|| when::time(&format!("{start_s}:00"))).ok_or_else(|| format!("can't read the start `{start_s}`"))?)
+        };
+        let (end, days) = match start {
+            Some(s) => {
+                let e = if end_s.is_empty() {
+                    s + chrono::Duration::hours(1)
+                } else if let Some(t) = when::time(&end_s).or_else(|| when::time(&format!("{end_s}:00"))) {
+                    t
+                } else {
+                    let ws: Vec<&str> = end_s.split_whitespace().collect();
+                    s + when::duration(&ws).map(|(d, _)| d).ok_or_else(|| format!("can't read the end `{end_s}`"))?
+                };
+                (Some(e), 1)
+            }
+            None => {
+                let days = if end_s.is_empty() {
+                    1
+                } else {
+                    let ws: Vec<&str> = end_s.split_whitespace().collect();
+                    let last = when::date_at(&ws, date).map(|(d, _)| d).ok_or_else(|| format!("can't read the last day `{end_s}`"))?;
+                    ((last - date).num_days() + 1).max(1)
+                };
+                (None, days)
+            }
+        };
+        Ok(when::Draft {
+            title,
+            date,
+            start,
+            end,
+            days,
+            location: f(4),
+            description: self.body.lines().join("\n").trim_end().to_string(),
+        })
+    }
+
+    fn body_idx(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Where Enter in an address field lands.
+    fn subject_idx(&self) -> usize {
+        if self.addr_fields > 0 {
+            SUBJECT
+        } else {
+            self.focus + 1
+        }
+    }
+
+    pub fn on_body(&self) -> bool {
+        self.focus == self.body_idx()
     }
 
     fn snapshot(&self) -> String {
@@ -116,7 +246,7 @@ impl Composer {
     }
 
     pub fn is_address_field(&self) -> bool {
-        self.focus < SUBJECT
+        self.focus < self.addr_fields
     }
 
     /// The text being completed: the part of the address field after the last comma.
@@ -147,7 +277,7 @@ impl Composer {
     }
 
     fn cur(&mut self) -> &mut TextArea<'static> {
-        if self.focus == BODY {
+        if self.focus == self.body_idx() {
             &mut self.body
         } else {
             &mut self.fields[self.focus]
@@ -159,7 +289,7 @@ impl Composer {
             self.cur().cancel_selection();
             self.mode = VMode::Normal;
         }
-        self.focus = f.min(BODY);
+        self.focus = f.min(self.body_idx());
         self.completions.clear();
         self.sel = None;
     }
@@ -250,15 +380,15 @@ impl Composer {
                 self.sel = Some(self.sel.map_or(n - 1, |s| (s + n - 1) % n));
                 return Outcome::None;
             }
-            KeyCode::Down if n > 0 && self.focus < BODY => {
+            KeyCode::Down if n > 0 && self.focus < self.body_idx() => {
                 self.sel = Some(self.sel.map_or(0, |s| (s + 1) % n));
                 return Outcome::None;
             }
-            KeyCode::Up if n > 0 && self.focus < BODY => {
+            KeyCode::Up if n > 0 && self.focus < self.body_idx() => {
                 self.sel = Some(self.sel.map_or(n - 1, |s| (s + n - 1) % n));
                 return Outcome::None;
             }
-            KeyCode::Tab if self.focus < BODY => {
+            KeyCode::Tab if self.focus < self.body_idx() => {
                 if !self.accept_completion() {
                     self.focus_to(self.focus + 1);
                 }
@@ -268,24 +398,30 @@ impl Composer {
                 self.focus_to(self.focus.saturating_sub(1));
                 return Outcome::None;
             }
+            // Vim's insert-mode ^u (the widget would undo instead).
+            KeyCode::Char('u') if ctrl => {
+                self.cur().delete_line_by_head();
+                return Outcome::None;
+            }
             // Enter takes the suggestion on screen; otherwise address fields jump to
             // Subject (Tab visits Cc/Bcc) and Subject drops into the body.
-            KeyCode::Enter if self.focus < BODY => {
+            KeyCode::Enter if self.focus < self.body_idx() => {
                 if !self.accept_completion() {
-                    self.focus_to(if self.focus < SUBJECT { SUBJECT } else { BODY });
+                    let next = if self.focus < self.addr_fields { self.subject_idx() } else { self.focus + 1 };
+                    self.focus_to(next);
                 }
                 return Outcome::None;
             }
-            KeyCode::Down if self.focus < BODY => {
+            KeyCode::Down if self.focus < self.body_idx() => {
                 self.focus_to(self.focus + 1);
                 return Outcome::None;
             }
-            KeyCode::Up if self.focus < BODY => {
+            KeyCode::Up if self.focus < self.body_idx() => {
                 self.focus_to(self.focus.saturating_sub(1));
                 return Outcome::None;
             }
-            KeyCode::Up if self.focus == BODY && self.body.cursor().0 == 0 => {
-                self.focus_to(SUBJECT);
+            KeyCode::Up if self.on_body() && self.body.cursor().0 == 0 => {
+                self.focus_to(self.body_idx() - 1);
                 return Outcome::None;
             }
             _ => {}
@@ -301,7 +437,7 @@ impl Composer {
     fn normal_key(&mut self, k: KeyEvent) -> Outcome {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let visual = self.mode == VMode::Visual;
-        let on_body = self.focus == BODY;
+        let on_body = self.on_body();
 
         if let Some(p) = self.pending.take() {
             return self.pending_key(p, k);
@@ -375,7 +511,7 @@ impl Composer {
                 if on_body {
                     self.body.move_cursor(CursorMove::Bottom)
                 } else {
-                    self.focus_to(BODY);
+                    self.focus_to(self.body_idx());
                     self.body.move_cursor(CursorMove::Bottom)
                 }
             }
@@ -474,7 +610,7 @@ impl Composer {
         let KeyCode::Char(c) = k.code else { return Outcome::None };
         match (p, c) {
             ('g', 'g') => {
-                if self.focus == BODY && self.body.cursor().0 > 0 {
+                if self.on_body() && self.body.cursor().0 > 0 {
                     self.body.move_cursor(CursorMove::Top);
                 } else {
                     self.focus_to(TO);
@@ -667,10 +803,10 @@ mod tests {
     #[test]
     fn field_navigation() {
         let mut c = new("x");
-        assert_eq!(c.focus, BODY);
+        assert!(c.on_body());
         press(&mut c, "\x1bkk");
         assert_eq!(c.focus, BCC);
         press(&mut c, "jj");
-        assert_eq!(c.focus, BODY);
+        assert!(c.on_body());
     }
 }
