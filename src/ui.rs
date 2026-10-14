@@ -1200,7 +1200,7 @@ fn draw_cal_sidebar(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
 
     // A small month at the bottom, marking today, the cursor's day and busy days.
     let day = cal.cursor_day();
-    let today = Local::now().date_naive();
+    let today = crate::calendar::today();
     let busy: std::collections::HashSet<chrono::NaiveDate> = cal
         .rows
         .windows(2)
@@ -1255,7 +1255,7 @@ fn draw_agenda(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let cal = &app.cal;
     let mut head = vec![pane_title("Agenda", focused, t)];
     let n = cal.rows.iter().filter(|r| matches!(r, CalRow::Event(_))).count();
-    head.push(Span::styled(format!("  {n} events"), Style::default().fg(t.subtle)));
+    head.push(Span::styled(format!("  {n} events · {}", crate::calendar::now().format("%Z")), Style::default().fg(t.subtle)));
     if !cal.filter.is_empty() {
         head.push(Span::styled(format!("  /{}", cal.filter), Style::default().fg(t.yellow)));
     }
@@ -1263,7 +1263,7 @@ fn draw_agenda(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         head.push(Span::styled("  syncing…", Style::default().fg(t.subtle)));
     }
     let mut lines = vec![Line::from(head)];
-    let now = Local::now();
+    let now = crate::calendar::now();
     let today = now.date_naive();
     let time_w = 11;
     for (ri, row) in cal.rows.iter().enumerate().skip(cal.offset).take(cal.height) {

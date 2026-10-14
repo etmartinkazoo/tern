@@ -155,7 +155,12 @@ password_cmd = "pass show mail/personal"   # or: account = "Personal" to reuse i
 
 Syncing only downloads what changed since the last sync when the server
 supports that, and the result is cached, so the calendar opens instantly and
-works offline. Edits change only the title, times, place and notes, and keep
+works offline.
+
+Calendar times are shown and entered in one time zone, US Eastern
+(`America/New_York`) by default. Change it under Settings → General → Time zone
+with an IANA name or `est`/`cst`/`mst`/`pst`/`utc`; daylight time is handled.
+The agenda opens on today, with earlier days a `k` away. Edits change only the title, times, place and notes, and keep
 everything else in the event (attendees, alarms, time zone) as it was.
 
 Meeting invitations show as a card at the top of the message: when, where, who

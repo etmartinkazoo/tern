@@ -243,6 +243,7 @@ impl App {
 
     pub fn start(&mut self) {
         self.apply_calendar_config();
+        self.apply_timezone();
         self.threaded = self.cfg.ui.threads;
         self.fold_default = self.cfg.ui.collapse_threads;
         for a in &self.accts {
@@ -1305,7 +1306,7 @@ impl App {
         let cal_job = match (partstat, existing) {
             ("DECLINED", Some((ci, id))) => {
                 let c = &self.cal.calendars[ci];
-                Some((c.source.clone(), c.id.clone(), id.clone(), None, c.etags.get(&id).cloned()))
+                Some((c.source.clone(), c.target(), id.clone(), None, c.etags.get(&id).cloned()))
             }
             ("DECLINED", None) => None,
             (_, found) => {
@@ -1328,7 +1329,7 @@ impl App {
                 };
                 (ci != usize::MAX).then(|| {
                     let c = &self.cal.calendars[ci];
-                    (c.source.clone(), c.id.clone(), id.clone(), Some(copy), c.etags.get(&id).cloned())
+                    (c.source.clone(), c.target(), id.clone(), Some(copy), c.etags.get(&id).cloned())
                 })
             }
         };
@@ -1819,6 +1820,14 @@ impl App {
         }
     }
 
+    /// Set the calendar's zone from config; an unreadable name keeps the default.
+    pub fn apply_timezone(&mut self) {
+        match crate::calendar::parse_zone(&self.cfg.ui.calendar_timezone) {
+            Some(z) => crate::calendar::set_zone(z),
+            None => self.say_error(format!("unknown calendar_timezone `{}` — using America/New_York", self.cfg.ui.calendar_timezone)),
+        }
+    }
+
     /// Hidden calendars and the default, from config.
     pub fn apply_calendar_config(&mut self) {
         self.cal.hidden = self.cfg.dav.iter().flat_map(|d| d.hidden.iter().map(|h| (d.name.clone(), h.clone()))).collect();
@@ -2254,6 +2263,10 @@ impl App {
                 self.refilter();
             }
             "collapse_threads" => self.fold_all(self.cfg.ui.collapse_threads),
+            "calendar_timezone" => {
+                self.apply_timezone();
+                self.cal.today_at_top();
+            }
             "mouse" => self.actions.push(Action::Mouse(self.cfg.ui.mouse)),
             _ => {}
         }
@@ -2526,6 +2539,16 @@ mod tests {
         // The server's confirmation runs the removal again; still put.
         a.remove_local(&(2..12).map(|i| 100 - i).collect::<Vec<_>>());
         assert_eq!(a.selected().unwrap().uid, uid);
+    }
+
+    #[test]
+    fn c_opens_the_calendar_and_back() {
+        let mut a = app(3);
+        a.demo = true;
+        a.on_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert_eq!(a.screen, crate::calview::View::Calendar);
+        a.on_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert_eq!(a.screen, crate::calview::View::Mail);
     }
 
     #[test]

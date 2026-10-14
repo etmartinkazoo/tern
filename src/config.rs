@@ -208,6 +208,9 @@ pub struct Ui {
     /// Show each conversation as one row until opened with `za`.
     #[serde(default = "yes")]
     pub collapse_threads: bool,
+    /// Calendar times are shown and entered in this zone (IANA name or est/pst/…).
+    #[serde(default = "calendar_timezone")]
+    pub calendar_timezone: String,
     /// Where new events and accepted invitations go: "<source>/<calendar id>".
     #[serde(default)]
     pub default_calendar: Option<String>,
@@ -239,6 +242,9 @@ fn sidebar() -> u16 {
 }
 fn list_pct() -> u16 {
     40
+}
+fn calendar_timezone() -> String {
+    "America/New_York".into()
 }
 fn mark_read_ms() -> u64 {
     800
@@ -361,6 +367,7 @@ paint_background = false  # keep the terminal's (transparent) background
 mark_read_ms = 800        # dwell before a message counts as read; 0 = instantly
 mouse = true              # click/scroll; shift-drag still selects text in most terminals
 threads = true            # group into conversations (T toggles)
+calendar_timezone = "America/New_York"   # or est, pst, Europe/Berlin, …
 collapse_threads = true   # one row per conversation (za / zR / zM)
 # theme_dir = "~/.config/omarchy/current/theme"
 "#;

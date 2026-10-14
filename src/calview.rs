@@ -5,7 +5,8 @@ use crate::app::{Action, App, Focus};
 use crate::calendar::{self, Occurrence};
 use crate::dav::CachedCalendar;
 use crate::model::Event;
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone};
+use chrono_tz::Tz;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashSet;
 use std::time::Instant;
@@ -44,6 +45,11 @@ pub struct CalState {
     pub default: Option<String>,
     /// Whether the sidebar has focus (then its cursor picks where events go).
     pub side_focused: bool,
+    /// Expansions per (source, calendar, item), with what they were computed for.
+    #[allow(clippy::type_complexity)]
+    expanded: std::collections::HashMap<(String, String, String), ((u64, NaiveDate, NaiveDate, &'static str), Vec<Occurrence>)>,
+    /// Whether the calendar has been shown yet (it opens on today the first time).
+    pub opened: bool,
     /// Last sync failure per source, for the settings view.
     pub source_errors: std::collections::HashMap<String, String>,
 }
@@ -51,13 +57,13 @@ pub struct CalState {
 const BEFORE: i64 = 14;
 const AFTER: i64 = 120;
 
-fn day_start(d: NaiveDate) -> DateTime<Local> {
-    Local.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap_or_else(Local::now)
+fn day_start(d: NaiveDate) -> DateTime<Tz> {
+    calendar::zone().from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap_or_else(calendar::now)
 }
 
 impl CalState {
     pub fn new() -> Self {
-        let today = Local::now().date_naive();
+        let today = calendar::today();
         CalState {
             calendars: crate::dav::load_cache(),
             hidden: HashSet::new(),
@@ -76,6 +82,8 @@ impl CalState {
             pending_g: false,
             default: None,
             side_focused: false,
+            opened: false,
+            expanded: Default::default(),
             source_errors: Default::default(),
         }
     }
@@ -92,12 +100,29 @@ impl CalState {
         self.window = (from, to);
         let (a, b) = (day_start(from), day_start(to));
         let mut occ = Vec::new();
+        let zone = calendar::zone().name();
         for (i, c) in self.calendars.iter().enumerate() {
             if !self.visible(i) {
                 continue;
             }
             for (id, ics) in &c.items {
-                occ.extend(calendar::expand(ics, id, i, a, b));
+                // Expanding is the slow part; reuse it until the event, the window or
+                // the zone changes.
+                let key = (c.source.clone(), c.id.clone(), id.clone());
+                let stamp = (fingerprint(ics), from, to, zone);
+                match self.expanded.get(&key) {
+                    Some((st, list)) if *st == stamp => {
+                        occ.extend(list.iter().cloned().map(|mut o| {
+                            o.calendar = i;
+                            o
+                        }));
+                    }
+                    _ => {
+                        let list = calendar::expand(ics, id, i, a, b);
+                        occ.extend(list.iter().cloned());
+                        self.expanded.insert(key, (stamp, list));
+                    }
+                }
             }
         }
         let q = self.filter.to_lowercase();
@@ -117,7 +142,7 @@ impl CalState {
     /// days; today always gets a heading, events or not.
     fn layout(&mut self) {
         let keep = self.selected().map(|o| (o.uid.clone(), o.start));
-        let today = Local::now().date_naive();
+        let today = calendar::today();
         let mut days: std::collections::BTreeMap<NaiveDate, Vec<usize>> = Default::default();
         days.entry(today).or_default();
         for (i, o) in self.occ.iter().enumerate() {
@@ -136,12 +161,20 @@ impl CalState {
             self.rows.push(Row::Day(d));
             self.rows.extend(evs.into_iter().map(Row::Event));
         }
-        self.cursor = keep
-            .and_then(|(uid, start)| {
-                self.rows.iter().position(|r| matches!(r, Row::Event(i) if self.occ[*i].uid == uid && self.occ[*i].start == start))
-            })
-            .unwrap_or_else(|| self.first_on_or_after(self.date));
-        self.scroll_into_view();
+        let kept = keep.and_then(|(uid, start)| {
+            self.rows.iter().position(|r| matches!(r, Row::Event(i) if self.occ[*i].uid == uid && self.occ[*i].start == start))
+        });
+        match kept {
+            Some(c) => {
+                self.cursor = c;
+                self.scroll_into_view();
+            }
+            // Nothing selected yet: start at the anchor day, at the top.
+            None => {
+                self.cursor = self.first_on_or_after(self.date);
+                self.day_at_top();
+            }
+        }
     }
 
     pub fn selected(&self) -> Option<&Occurrence> {
@@ -220,7 +253,23 @@ impl CalState {
         }
         self.cursor = self.first_on_or_after(d);
         self.detail_scroll = 0;
+        self.day_at_top();
+    }
+
+    /// Scroll so the cursor's day heading is the first row: the agenda reads from
+    /// that day on, with earlier days one k away.
+    fn day_at_top(&mut self) {
+        let day = self.cursor_day();
+        self.offset = self.rows.iter().position(|r| matches!(r, Row::Day(d) if *d >= day)).unwrap_or(0);
         self.scroll_into_view();
+    }
+
+    /// Re-anchor on today (on opening, and when the zone changes).
+    pub fn today_at_top(&mut self) {
+        self.date = calendar::today();
+        self.expand();
+        self.cursor = self.first_on_or_after(self.date);
+        self.day_at_top();
     }
 
     /// Where new events go: the calendar under the sidebar cursor, else the selected
@@ -265,8 +314,9 @@ impl App {
         };
         if self.screen == View::Calendar {
             self.focus = Focus::List;
-            if self.cal.rows.is_empty() {
-                self.cal.expand();
+            if self.cal.rows.is_empty() || !self.cal.opened {
+                self.cal.opened = true;
+                self.cal.today_at_top();
             }
             let stale = self.cal.synced_at.is_none_or(|t| t.elapsed().as_secs() > 300);
             if stale {
@@ -348,7 +398,7 @@ impl App {
                     Focus::Body => Focus::List,
                 }
             }
-            (_, KeyCode::Char('t')) => self.cal.goto_day(Local::now().date_naive()),
+            (_, KeyCode::Char('t')) => self.cal.goto_day(calendar::today()),
             (_, KeyCode::Char('a')) => match self.cal.target() {
                 Some(i) => {
                     let name = self.cal.calendars[i].name.clone();
@@ -491,7 +541,7 @@ impl App {
     }
 
     fn open_event_form(&mut self, existing: Option<Occurrence>) {
-        let today = Local::now().date_naive();
+        let today = calendar::today();
         let (draft, form, title) = match existing {
             Some(o) => {
                 let ics = self.cal.calendars[o.calendar].items.get(&o.item).cloned().unwrap_or_default();
@@ -524,7 +574,7 @@ impl App {
     }
 
     pub fn quick_add(&mut self, input: &str) {
-        let today = Local::now().date_naive();
+        let today = calendar::today();
         let default = if self.cal.rows.is_empty() { today } else { self.cal.cursor_day() };
         let Some(d) = crate::when::parse_on(input, today, default) else {
             return self.say_error("couldn't find a title in that");
@@ -535,7 +585,7 @@ impl App {
 
     pub fn save_event(&mut self, c: Box<crate::composer::Composer>) {
         let Some(form) = c.event.clone() else { return };
-        match c.event_draft(Local::now().date_naive()) {
+        match c.event_draft(calendar::today()) {
             Ok(d) => self.write_event(form.calendar, form.item, d),
             Err(e) => {
                 self.say_error(e);
@@ -574,7 +624,7 @@ impl App {
             return self.say(format!("{done} (demo: not saved)"));
         }
         self.say(format!("{done} · saving…"));
-        let (source, cal_id) = (self.cal.calendars[cal].source.clone(), self.cal.calendars[cal].id.clone());
+        let (source, cal_id) = (self.cal.calendars[cal].source.clone(), self.cal.calendars[cal].target());
         let (cfg, tx) = (self.cfg.clone(), self.events_tx.clone());
         tokio::spawn(async move {
             let r = crate::dav::put_event(cfg, source, cal_id, id, ics, etag).await;
@@ -585,7 +635,7 @@ impl App {
     pub fn delete_event(&mut self) {
         let Some(o) = self.cal.selected().cloned() else { return };
         let c = &self.cal.calendars[o.calendar];
-        let (source, cal_id, etag) = (c.source.clone(), c.id.clone(), c.etags.get(&o.item).cloned());
+        let (source, cal_id, etag) = (c.source.clone(), c.target(), c.etags.get(&o.item).cloned());
         self.cal.calendars[o.calendar].items.remove(&o.item);
         self.cal.expand();
         let done = format!("deleted “{}”", o.summary);
@@ -642,4 +692,11 @@ pub fn color(c: &CachedCalendar, i: usize, t: &crate::theme::Theme) -> ratatui::
         return col;
     }
     [t.blue, t.magenta, t.green, t.yellow, t.cyan, t.red][i % 6]
+}
+
+fn fingerprint(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }

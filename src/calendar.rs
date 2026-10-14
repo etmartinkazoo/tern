@@ -3,7 +3,48 @@
 //! ical-rs's (Pimalaya); this file turns its civil times into local ones and picks out
 //! what the agenda shows.
 
-use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
+use std::sync::RwLock;
+
+// ------------------------------------------------------------------- the calendar's time zone
+
+/// Every calendar time is shown and entered in this zone (Settings → General).
+static ZONE: RwLock<Option<Tz>> = RwLock::new(None);
+
+pub const DEFAULT_ZONE: Tz = chrono_tz::America::New_York;
+
+pub fn zone() -> Tz {
+    ZONE.read().ok().and_then(|z| *z).unwrap_or(DEFAULT_ZONE)
+}
+
+pub fn set_zone(z: Tz) {
+    if let Ok(mut w) = ZONE.write() {
+        *w = Some(z);
+    }
+}
+
+pub fn now() -> DateTime<Tz> {
+    Utc::now().with_timezone(&zone())
+}
+
+pub fn today() -> NaiveDate {
+    now().date_naive()
+}
+
+/// An IANA zone name, or a common shorthand: est/eastern, cst/central, mst/mountain,
+/// pst/pacific (all with daylight time), utc/gmt.
+pub fn parse_zone(s: &str) -> Option<Tz> {
+    let alias = match s.trim().to_lowercase().as_str() {
+        "est" | "edt" | "et" | "eastern" | "us/eastern" => "America/New_York",
+        "cst" | "cdt" | "ct" | "central" | "us/central" => "America/Chicago",
+        "mst" | "mdt" | "mt" | "mountain" | "us/mountain" => "America/Denver",
+        "pst" | "pdt" | "pt" | "pacific" | "us/pacific" => "America/Los_Angeles",
+        "utc" | "gmt" | "z" => "UTC",
+        _ => s.trim(),
+    };
+    alias.parse::<Tz>().ok()
+}
 use ical::component::{IcalComponent, IcalComponentKind, IcalComponentName};
 use ical::param::IcalParam;
 use ical::prop::{IcalPropKind, IcalPropName};
@@ -25,8 +66,8 @@ pub struct Occurrence {
     pub description: String,
     pub organizer: String,
     pub attendees: Vec<String>,
-    pub start: DateTime<Local>,
-    pub end: DateTime<Local>,
+    pub start: DateTime<Tz>,
+    pub end: DateTime<Tz>,
     pub all_day: bool,
     pub recurring: bool,
     pub url: String,
@@ -166,31 +207,31 @@ pub fn duration_secs(v: &str) -> Option<i64> {
     Some(if neg { -total } else { total })
 }
 
-/// A civil time on `zone` as a local date-time. Zones come from the calendar's own
+/// A civil time on `zone` as a date-time in the calendar's zone. Zones come from the calendar's own
 /// VTIMEZONEs first, then the IANA database; anything unknown is read as local time.
-fn to_local(t: IcalRecurDateTime, zone: &IcalRecurZone, zones: &[IcalTz]) -> Option<DateTime<Local>> {
+fn to_local(t: IcalRecurDateTime, written: &IcalRecurZone, zones: &[IcalTz]) -> Option<DateTime<Tz>> {
     let naive = NaiveDate::from_ymd_opt(t.year, t.month as u32, t.day as u32)?
         .and_hms_opt(t.hour as u32, t.minute as u32, t.second as u32)?;
-    let utc = |n: NaiveDateTime| Some(Utc.from_utc_datetime(&n).with_timezone(&Local));
-    match zone {
+    let utc = |n: NaiveDateTime| Some(Utc.from_utc_datetime(&n).with_timezone(&zone()));
+    match written {
         IcalRecurZone::Utc => utc(naive),
-        IcalRecurZone::Floating => Local.from_local_datetime(&naive).earliest(),
+        IcalRecurZone::Floating => zone().from_local_datetime(&naive).earliest(),
         IcalRecurZone::Tz(id) => {
             if let Some(z) = zones.iter().find(|z| &z.id == id) {
                 if let Some(secs) = z.resolve(t).instant(t) {
-                    return DateTime::from_timestamp(secs, 0).map(|d| d.with_timezone(&Local));
+                    return DateTime::from_timestamp(secs, 0).map(|d| d.with_timezone(&zone()));
                 }
             }
             match id.parse::<chrono_tz::Tz>() {
-                Ok(tz) => tz.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&Local)),
-                Err(_) => Local.from_local_datetime(&naive).earliest(),
+                Ok(tz) => tz.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&zone())),
+                Err(_) => zone().from_local_datetime(&naive).earliest(),
             }
         }
     }
 }
 
 /// Every occurrence of the events in one iCalendar object that overlaps `from..to`.
-pub fn expand(ics: &str, item: &str, calendar: usize, from: DateTime<Local>, to: DateTime<Local>) -> Vec<Occurrence> {
+pub fn expand(ics: &str, item: &str, calendar: usize, from: DateTime<Tz>, to: DateTime<Tz>) -> Vec<Occurrence> {
     let Ok(cst) = IcalCst::parse(ics) else { return vec![] };
     let cal = cst.decode();
     let comps = &cal.components;
@@ -231,9 +272,21 @@ pub fn expand(ics: &str, item: &str, calendar: usize, from: DateTime<Local>, to:
             .filter_map(|p| Some((civil(p.recurrence_id.as_ref()?)?, p)))
             .collect();
 
+        // Compare civil times first (a day of slack covers any zone offset) and only
+        // convert the instances near the window: a yearly event since 1970 otherwise
+        // costs a zone conversion for every year.
+        let civil_from = from.naive_local().and_utc().timestamp() - 86_400 - master_len.max(0);
+        let civil_to = to.naive_local().and_utc().timestamp() + 86_400;
         for (n, occ) in set.expand().enumerate() {
-            if n > 5000 {
+            if n > 20_000 {
                 break;
+            }
+            let c = occ.start.seconds();
+            if c > civil_to {
+                break;
+            }
+            if c < civil_from && !overrides.iter().any(|(id, _)| *id == occ.id) {
+                continue;
             }
             let Some(start) = to_local(occ.start, &zone, &zones) else { continue };
             if start > to {
@@ -273,8 +326,8 @@ pub fn expand(ics: &str, item: &str, calendar: usize, from: DateTime<Local>, to:
 mod tests {
     use super::*;
 
-    fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
-        Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Tz> {
+        zone().with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
     }
 
     const WEEKLY: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\n\
@@ -317,6 +370,20 @@ BEGIN:VEVENT\r\nUID:u\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T160000Z\r\
         // Noon in New York in July is 16:00 UTC.
         assert_eq!(o[0].start, o[1].start);
         assert_eq!((o[0].end - o[0].start).num_minutes(), 45);
+    }
+
+    #[test]
+    fn zones_and_shorthands() {
+        assert_eq!(parse_zone("est"), Some(chrono_tz::America::New_York));
+        assert_eq!(parse_zone("Pacific"), Some(chrono_tz::America::Los_Angeles));
+        assert_eq!(parse_zone("Europe/Berlin"), Some(chrono_tz::Europe::Berlin));
+        assert_eq!(parse_zone("Mars/Base"), None);
+        // 16:00 UTC in July shows as noon in the default (New York) zone, whatever the
+        // machine's own zone is.
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:z\r\nDTSTAMP:20260101T000000Z\r\n\
+DTSTART:20260715T160000Z\r\nSUMMARY:x\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let o = expand(ics, "i", 0, local(2026, 7, 1, 0, 0), local(2026, 8, 1, 0, 0));
+        assert_eq!(o[0].start.format("%H:%M %Z").to_string(), "12:00 EDT");
     }
 
     #[test]
@@ -368,7 +435,7 @@ fn time_lines(d: &Draft, tzid: Option<&str>) -> (String, String) {
     match (d.start, d.end) {
         (Some(s), Some(e)) => {
             let at = |t: chrono::NaiveTime| -> String {
-                let local = Local.from_local_datetime(&d.date.and_time(t)).earliest().unwrap_or_else(Local::now);
+                let local = zone().from_local_datetime(&d.date.and_time(t)).earliest().unwrap_or_else(now);
                 match tzid.and_then(|z| z.parse::<chrono_tz::Tz>().ok()) {
                     Some(tz) => format!(";TZID={}:{}", tz.name(), local.with_timezone(&tz).format("%Y%m%dT%H%M%S")),
                     None => format!(":{}", local.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ")),
@@ -378,7 +445,7 @@ fn time_lines(d: &Draft, tzid: Option<&str>) -> (String, String) {
             let end_date_shift = if e <= s { 1 } else { 0 };
             let end = Draft { date: d.date + Duration::days(end_date_shift), ..d.clone() };
             let end_at = {
-                let local = Local.from_local_datetime(&end.date.and_time(e)).earliest().unwrap_or_else(Local::now);
+                let local = zone().from_local_datetime(&end.date.and_time(e)).earliest().unwrap_or_else(now);
                 match tzid.and_then(|z| z.parse::<chrono_tz::Tz>().ok()) {
                     Some(tz) => format!(";TZID={}:{}", tz.name(), local.with_timezone(&tz).format("%Y%m%dT%H%M%S")),
                     None => format!(":{}", local.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ")),
@@ -522,7 +589,7 @@ mod write_tests {
         let ics = new_ics(&draft(), "x@tern");
         let back = draft_of(&ics).unwrap();
         assert_eq!(back, draft());
-        let o = expand(&ics, "i", 0, Local::now() - Duration::days(3650), Local::now() + Duration::days(3650));
+        let o = expand(&ics, "i", 0, now() - Duration::days(3650), now() + Duration::days(3650));
         assert_eq!(o[0].summary, "Lunch, with Maya");
     }
 
@@ -556,8 +623,8 @@ pub struct Invite {
     pub uid: String,
     pub summary: String,
     pub location: String,
-    pub start: DateTime<Local>,
-    pub end: DateTime<Local>,
+    pub start: DateTime<Tz>,
+    pub end: DateTime<Tz>,
     pub all_day: bool,
     pub organizer: String,
     pub organizer_name: String,
@@ -615,7 +682,7 @@ pub fn invite(ics: &str) -> Option<Invite> {
         .find(|(n, _, _)| n == "METHOD")
         .map(|(_, _, v)| v.to_uppercase())
         .unwrap_or_else(|| "REQUEST".into());
-    let far = Local::now();
+    let far = now();
     let occ = expand(ics, "", 0, far - Duration::days(3650), far + Duration::days(3650));
     let first = occ.iter().find(|o| o.start >= far - Duration::days(1)).or(occ.first())?.clone();
     let mut inv = Invite {
@@ -740,3 +807,4 @@ SEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         assert!(c.contains("CN=\"Berg, Jonas\""));
     }
 }
+

@@ -291,6 +291,8 @@ SUMMARY:Standup (after the all-hands)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         sync_token: None,
         items: items.into_iter().enumerate().map(|(i, s)| (format!("{i}.ics"), s)).collect(),
         etags: Default::default(),
+        home: String::new(),
+        remote: String::new(),
     };
     vec![
         mk("Fastmail", "work", "Work", None, work),

@@ -44,6 +44,7 @@ pub async fn resolve(dav: &Dav, cfg: &crate::config::Config) -> Result<Source> {
 /// principal and home-set URLs) survive, so a multi-request call makes progress.
 struct Client {
     c: WebdavClientStd,
+    auth: WebdavAuth,
     host: String,
     port: u16,
     https: bool,
@@ -56,6 +57,7 @@ fn client(src: &Source) -> Result<Client> {
         .map_err(|e| anyhow!("{}: connecting to {}: {e}", src.dav.name, src.dav.url))?;
     Ok(Client {
         c,
+        auth: src.auth.clone(),
         host: url.host_str().unwrap_or_default().to_string(),
         port: url.port_or_known_default().unwrap_or(443),
         https: url.scheme() == "https",
@@ -169,11 +171,26 @@ pub struct CachedCalendar {
     pub name: String,
     pub color: Option<String>,
     pub sync_token: Option<String>,
+    /// The calendar's parent collection, and its own last path segment: io-webdav
+    /// addresses a calendar as home + segment, so tern points "home" at the real parent.
+    /// (Google keeps every calendar at `…/<calendar>/events/`.)
+    #[serde(default)]
+    pub home: String,
+    #[serde(default)]
+    pub remote: String,
     /// Resource id → raw iCalendar.
     pub items: BTreeMap<String, String>,
     /// Resource id → ETag, to fetch only what changed when diffing a full listing.
     #[serde(default)]
     pub etags: BTreeMap<String, String>,
+}
+
+impl CachedCalendar {
+    /// Where writes for this calendar go: (parent collection, last segment).
+    pub fn target(&self) -> (String, String) {
+        let remote = if self.remote.is_empty() { self.id.clone() } else { self.remote.clone() };
+        (self.home.clone(), remote)
+    }
 }
 
 fn cache_file() -> std::path::PathBuf {
@@ -192,6 +209,97 @@ fn save_cache(c: &[CachedCalendar]) -> Result<()> {
     Ok(())
 }
 
+/// A calendar collection as listed, with where it really lives.
+struct Found {
+    /// Unique within its source: the last segment, or (when several calendars share it,
+    /// as Google's `events` do) the distinguishing segment before it.
+    key: String,
+    remote: String,
+    home: url::Url,
+    name: String,
+    color: Option<String>,
+    components: Vec<String>,
+}
+
+fn decode(seg: &str) -> String {
+    url::form_urlencoded::parse(format!("x={}", seg.replace('+', "%2B")).as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_else(|| seg.to_string())
+}
+
+/// PROPFIND the calendar home ourselves (io-webdav's listing keeps only each calendar's
+/// last path segment) so every calendar keeps its full address.
+fn list_calendars(c: &mut Client) -> Result<Vec<Found>> {
+    use io_webdav::coroutine::{WebdavCoroutine, WebdavCoroutineState, WebdavYield};
+    use io_webdav::rfc4791::calendar::{CALENDAR, CALENDAR_COLOR, LIST_PROPS, SUPPORTED_CALENDAR_COMPONENT_SET};
+    use io_webdav::rfc4918::propfind::WebdavPropfind;
+    use io_webdav::rfc4918::{DISPLAYNAME, RESOURCETYPE};
+    use std::io::{Read, Write};
+
+    let home = c.call("calendars", |c| c.calendar_home_set())?;
+    let auth = c.auth.clone();
+    let ms = c.call("calendars", |w| -> std::result::Result<_, String> {
+        let mut co = WebdavPropfind::new(&w.base_url, &auth, &w.user_agent.clone(), home.path(), 1, LIST_PROPS);
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut n: Option<usize> = None;
+        loop {
+            let arg = n.take().map(|k| &buf[..k]);
+            match co.resume(arg) {
+                WebdavCoroutineState::Complete(r) => return r.map_err(|e| e.to_string()),
+                WebdavCoroutineState::Yielded(WebdavYield::WantsRead) => {
+                    n = Some(w.stream.read(&mut buf).map_err(|e| e.to_string())?);
+                }
+                WebdavCoroutineState::Yielded(WebdavYield::WantsWrite(bytes)) => {
+                    w.stream.write_all(&bytes).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    })?;
+    let mut found = Vec::new();
+    for e in &ms.responses {
+        if !e.has_resource_type(RESOURCETYPE, CALENDAR) {
+            continue;
+        }
+        let Ok(url) = home.join(&e.href) else { continue };
+        let segs: Vec<String> = url.path().trim_end_matches('/').split('/').map(decode).collect();
+        let Some(remote) = segs.last().cloned().filter(|s| !s.is_empty()) else { continue };
+        let parent_path = url.path().trim_end_matches('/').rsplit_once('/').map(|(p, _)| format!("{p}/")).unwrap_or_else(|| "/".into());
+        let mut parent = url.clone();
+        parent.set_path(&parent_path);
+        let components = e
+            .prop(SUPPORTED_CALENDAR_COMPONENT_SET)
+            .map(|item| item.children.iter().filter_map(|ch| ch.name.clone()).collect())
+            .unwrap_or_default();
+        found.push(Found {
+            key: remote.clone(),
+            remote,
+            home: parent,
+            name: e.text(DISPLAYNAME).map(String::from).unwrap_or_default(),
+            color: e.text(CALENDAR_COLOR).map(String::from),
+            components,
+        });
+        let _ = segs;
+    }
+    // Several calendars ending in the same segment: name them by the one before it.
+    let mut counts = std::collections::HashMap::new();
+    for f in &found {
+        *counts.entry(f.remote.clone()).or_insert(0) += 1;
+    }
+    for f in found.iter_mut() {
+        if counts[&f.remote] > 1 {
+            let segs: Vec<String> = f.home.path().trim_end_matches('/').split('/').map(decode).collect();
+            if let Some(p) = segs.last().filter(|s| !s.is_empty()) {
+                f.key = p.clone();
+            }
+        }
+        if f.name.is_empty() {
+            f.name = f.key.clone();
+        }
+    }
+    Ok(found)
+}
+
 /// Bring the cache up to date with every source: only what changed since the last sync
 /// token when the server supports it, a full listing when it doesn't.
 pub fn sync_calendars(sources: &[Source]) -> Result<(Vec<CachedCalendar>, Vec<String>)> {
@@ -201,25 +309,31 @@ pub fn sync_calendars(sources: &[Source]) -> Result<(Vec<CachedCalendar>, Vec<St
     for src in sources {
         let r: Result<()> = (|| {
             let mut c = client(src)?;
-            c.call("calendars", |c| c.calendar_home_set())?;
-            for cal in c.call("calendars", |c| c.list_calendars())? {
+            for cal in list_calendars(&mut c)? {
                 if !cal.components.is_empty() && !cal.components.iter().any(|x| x.eq_ignore_ascii_case("VEVENT")) {
                     continue;
                 }
+                // A cached copy is reused only when it is the same collection (an old
+                // cache entry with a colliding id would otherwise leak into it).
                 let mut entry = old
                     .iter()
-                    .find(|o| o.source == src.dav.name && o.id == cal.id)
+                    .find(|o| o.source == src.dav.name && o.id == cal.key && (o.home.is_empty() || o.home == cal.home.as_str()))
+                    .filter(|o| !o.home.is_empty())
                     .cloned()
                     .unwrap_or_default();
                 entry.source = src.dav.name.clone();
-                entry.id = cal.id.clone();
-                entry.name = cal.display_name.clone().unwrap_or_else(|| cal.id.clone());
+                entry.id = cal.key.clone();
+                entry.name = cal.name.clone();
                 entry.color = cal.color.clone();
+                entry.home = cal.home.to_string();
+                entry.remote = cal.remote.clone();
+                c.c.calendar_home_set = Some(cal.home.clone());
+                let cal_id = cal.remote.clone();
 
                 // Incremental REPORT first. Without a token the server lists everything,
                 // which is a full snapshot; with one it sends only changes and deletions.
                 let token = entry.sync_token.clone();
-                let report = c.call("sync", |c| c.sync_items(&cal.id, token.as_deref(), WebdavSyncCollectionOptions::default()));
+                let report = c.call("sync", |c| c.sync_items(&cal_id, token.as_deref(), WebdavSyncCollectionOptions::default()));
                 let (delta, snapshot) = match report {
                     Ok(d) if !d.truncated => {
                         let full = token.is_none();
@@ -229,7 +343,7 @@ pub fn sync_calendars(sources: &[Source]) -> Result<(Vec<CachedCalendar>, Vec<St
                     // collection and diff it ourselves.
                     _ => {
                         let opts = WebdavSyncCollectionOptions { fallback: true };
-                        (c.call("listing", |c| c.sync_items(&cal.id, None, opts))?, true)
+                        (c.call("listing", |c| c.sync_items(&cal_id, None, opts))?, true)
                     }
                 };
                 let listed: BTreeMap<String, Option<String>> =
@@ -251,7 +365,7 @@ pub fn sync_calendars(sources: &[Source]) -> Result<(Vec<CachedCalendar>, Vec<St
                     .collect();
                 for chunk in wanted.chunks(100) {
                     let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-                    for item in c.call(&entry.name, |c| c.multiget_items(&cal.id, &refs))? {
+                    for item in c.call(&entry.name, |c| c.multiget_items(&cal_id, &refs))? {
                         let id = last_segment(&item.id);
                         if let Some(e) = &item.etag {
                             entry.etags.insert(id.clone(), e.clone());
@@ -318,14 +432,30 @@ pub async fn add_contact_to_first(cfg: crate::config::Config, name: String, emai
 
 // ------------------------------------------------------------------- writing events
 
+/// Point the client at a calendar: `(home, remote)` from the cache, or (for entries
+/// cached before tern tracked addresses) the discovered home and the calendar's id.
+fn aim(c: &mut Client, target: &(String, String)) -> Result<String> {
+    let (home, remote) = target;
+    match url::Url::parse(home) {
+        Ok(u) if !home.is_empty() => {
+            c.c.calendar_home_set = Some(u);
+            Ok(remote.clone())
+        }
+        _ => {
+            c.call("calendars", |c| c.calendar_home_set())?;
+            Ok(remote.clone())
+        }
+    }
+}
+
 /// Create or replace an event. `etag` guards an update against overwriting a change
 /// made elsewhere since the last sync.
-pub async fn put_event(cfg: crate::config::Config, source: String, calendar: String, item: String, ics: String, etag: Option<String>) -> Result<()> {
+pub async fn put_event(cfg: crate::config::Config, source: String, target: (String, String), item: String, ics: String, etag: Option<String>) -> Result<()> {
     let d = cfg.dav_sources().into_iter().find(|d| d.name == source).ok_or_else(|| anyhow!("no [[dav]] source named {source}"))?;
     let src = resolve(&d, &cfg).await?;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut c = client(&src)?;
-        c.call("calendars", |c| c.calendar_home_set())?;
+        let calendar = aim(&mut c, &target)?;
         let bytes = ics.into_bytes();
         match etag {
             None => {
@@ -341,12 +471,12 @@ pub async fn put_event(cfg: crate::config::Config, source: String, calendar: Str
     .await?
 }
 
-pub async fn delete_event(cfg: crate::config::Config, source: String, calendar: String, item: String, etag: Option<String>) -> Result<()> {
+pub async fn delete_event(cfg: crate::config::Config, source: String, target: (String, String), item: String, etag: Option<String>) -> Result<()> {
     let d = cfg.dav_sources().into_iter().find(|d| d.name == source).ok_or_else(|| anyhow!("no [[dav]] source named {source}"))?;
     let src = resolve(&d, &cfg).await?;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut c = client(&src)?;
-        c.call("calendars", |c| c.calendar_home_set())?;
+        let calendar = aim(&mut c, &target)?;
         c.call("deleting event", |c| c.delete_item(&calendar, &item, etag.as_deref()))?;
         Ok(())
     })
