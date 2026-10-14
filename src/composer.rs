@@ -1,0 +1,676 @@
+//! The in-pane composer: header fields and a body with vim-style modal editing, drawn in
+//! the message column so the list stays in view while you write.
+
+use crate::compose::Draft;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tui_textarea::{CursorMove, Input, TextArea};
+use unicode_width::UnicodeWidthChar;
+
+pub const TO: usize = 0;
+pub const CC: usize = 1;
+pub const BCC: usize = 2;
+pub const SUBJECT: usize = 3;
+pub const BODY: usize = 4;
+pub const LABELS: [&str; 4] = ["To", "Cc", "Bcc", "Subject"];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VMode {
+    Normal,
+    Insert,
+    Visual,
+}
+
+/// What the app should do after a key.
+pub enum Outcome {
+    None,
+    Send,
+    SaveDraft,
+    Discard,
+    Attach,
+    External,
+    Say(String),
+}
+
+pub struct Composer {
+    pub title: String,
+    pub draft: Draft,
+    pub fields: [TextArea<'static>; 4],
+    pub body: TextArea<'static>,
+    pub focus: usize,
+    pub mode: VMode,
+    /// `:` command line being typed, if any.
+    pub command: Option<String>,
+    pending: Option<char>,
+    pub completions: Vec<String>,
+    pub sel: Option<usize>,
+    /// First visible row of the soft-wrapped body.
+    pub scroll: usize,
+    original: String,
+}
+
+fn area(text: &str) -> TextArea<'static> {
+    let lines: Vec<String> = if text.is_empty() { vec![String::new()] } else { text.lines().map(String::from).collect() };
+    let mut t = TextArea::new(lines);
+    t.set_cursor_line_style(ratatui::style::Style::default());
+    t
+}
+
+impl Composer {
+    pub fn new(title: &str, draft: Draft) -> Self {
+        let fields = [area(&draft.to), area(&draft.cc), area(&draft.bcc), area(&draft.subject)];
+        let mut body = area(&draft.body);
+        body.move_cursor(CursorMove::Top);
+        let focus = if draft.to.trim().is_empty() {
+            TO
+        } else if draft.subject.trim().is_empty() {
+            SUBJECT
+        } else {
+            BODY
+        };
+        let mut c = Composer {
+            title: title.to_string(),
+            original: String::new(),
+            draft,
+            fields,
+            body,
+            focus,
+            mode: VMode::Insert,
+            command: None,
+            pending: None,
+            completions: vec![],
+            sel: None,
+            scroll: 0,
+        };
+        for f in c.fields.iter_mut() {
+            f.move_cursor(CursorMove::End);
+        }
+        c.original = c.snapshot();
+        c
+    }
+
+    fn snapshot(&self) -> String {
+        let mut s: String = self.fields.iter().map(|f| f.lines().join(" ")).collect::<Vec<_>>().join("\n");
+        s.push('\n');
+        s.push_str(&self.body.lines().join("\n"));
+        s
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.original = self.snapshot();
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.snapshot() != self.original
+    }
+
+    /// The draft with the editor's current contents.
+    pub fn to_draft(&self) -> Draft {
+        let field = |i: usize| self.fields[i].lines().join(" ").trim().to_string();
+        let mut d = self.draft.clone();
+        d.to = field(TO).trim_end_matches(',').trim().to_string();
+        d.cc = field(CC).trim_end_matches(',').trim().to_string();
+        d.bcc = field(BCC).trim_end_matches(',').trim().to_string();
+        d.subject = field(SUBJECT);
+        d.body = self.body.lines().join("\n").trim_end().to_string() + "\n";
+        d
+    }
+
+    pub fn is_address_field(&self) -> bool {
+        self.focus < SUBJECT
+    }
+
+    /// The text being completed: the part of the address field after the last comma.
+    pub fn completion_query(&self) -> Option<String> {
+        if !self.is_address_field() || self.mode != VMode::Insert {
+            return None;
+        }
+        let line = self.fields[self.focus].lines().join(" ");
+        let last = line.rsplit(',').next().unwrap_or("").trim().to_string();
+        (!last.is_empty()).then_some(last)
+    }
+
+    fn accept_completion(&mut self) -> bool {
+        let Some(pick) = self.sel.or((!self.completions.is_empty()).then_some(0)).and_then(|i| self.completions.get(i).cloned()) else {
+            return false;
+        };
+        let line = self.fields[self.focus].lines().join(" ");
+        let head = match line.rfind(',') {
+            Some(i) => format!("{}, ", line[..i].trim_end()),
+            None => String::new(),
+        };
+        let mut t = area(&format!("{head}{pick}, "));
+        t.move_cursor(CursorMove::End);
+        self.fields[self.focus] = t;
+        self.completions.clear();
+        self.sel = None;
+        true
+    }
+
+    fn cur(&mut self) -> &mut TextArea<'static> {
+        if self.focus == BODY {
+            &mut self.body
+        } else {
+            &mut self.fields[self.focus]
+        }
+    }
+
+    fn focus_to(&mut self, f: usize) {
+        if self.mode == VMode::Visual {
+            self.cur().cancel_selection();
+            self.mode = VMode::Normal;
+        }
+        self.focus = f.min(BODY);
+        self.completions.clear();
+        self.sel = None;
+    }
+
+    pub fn key(&mut self, k: KeyEvent) -> Outcome {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        // Available in every mode.
+        if ctrl {
+            match k.code {
+                KeyCode::Char('s') => return Outcome::Send,
+                KeyCode::Char('t') => return Outcome::Attach,
+                KeyCode::Char('e') if self.mode != VMode::Insert => return Outcome::External,
+                _ => {}
+            }
+        }
+        if let Some(cmd) = self.command.as_mut() {
+            match k.code {
+                KeyCode::Esc => self.command = None,
+                KeyCode::Backspace => {
+                    if cmd.pop().is_none() {
+                        self.command = None;
+                    }
+                }
+                KeyCode::Enter => {
+                    let cmd = self.command.take().unwrap_or_default();
+                    return self.run_command(cmd.trim());
+                }
+                KeyCode::Char(c) => cmd.push(c),
+                _ => {}
+            }
+            return Outcome::None;
+        }
+        match self.mode {
+            VMode::Insert => self.insert_key(k),
+            VMode::Normal | VMode::Visual => self.normal_key(k),
+        }
+    }
+
+    fn run_command(&mut self, cmd: &str) -> Outcome {
+        let (name, arg) = cmd.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((cmd, ""));
+        match name {
+            "w" => Outcome::SaveDraft,
+            "wq" | "x" | "send" => Outcome::Send,
+            "q" if self.dirty() => Outcome::Say("unsent changes — :q! to discard, :wq to send".into()),
+            "q" | "q!" | "cq" => Outcome::Discard,
+            "e" | "edit" => Outcome::External,
+            "a" | "attach" if !arg.is_empty() => {
+                let p = crate::theme::expand(arg);
+                if p.is_file() {
+                    self.draft.attach_paths.push(p);
+                    Outcome::Say(format!("attached {arg}"))
+                } else {
+                    Outcome::Say(format!("not a file: {arg}"))
+                }
+            }
+            "a" | "attach" => Outcome::Attach,
+            "cc" | "bcc" | "to" | "subject" => {
+                let i = ["to", "cc", "bcc", "subject"].iter().position(|n| *n == name).unwrap();
+                self.focus_to(i);
+                self.mode = VMode::Insert;
+                Outcome::None
+            }
+            "" => Outcome::None,
+            _ => Outcome::Say(format!("unknown command :{name}")),
+        }
+    }
+
+    fn insert_key(&mut self, k: KeyEvent) -> Outcome {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        let n = self.completions.len();
+        match k.code {
+            KeyCode::Esc => {
+                self.mode = VMode::Normal;
+                self.completions.clear();
+                self.sel = None;
+                let t = self.cur();
+                if t.cursor().1 > 0 {
+                    t.move_cursor(CursorMove::Back);
+                }
+                return Outcome::None;
+            }
+            KeyCode::Char('n') if ctrl && n > 0 => {
+                self.sel = Some(self.sel.map_or(0, |s| (s + 1) % n));
+                return Outcome::None;
+            }
+            KeyCode::Char('p') if ctrl && n > 0 => {
+                self.sel = Some(self.sel.map_or(n - 1, |s| (s + n - 1) % n));
+                return Outcome::None;
+            }
+            KeyCode::Down if n > 0 && self.focus < BODY => {
+                self.sel = Some(self.sel.map_or(0, |s| (s + 1) % n));
+                return Outcome::None;
+            }
+            KeyCode::Up if n > 0 && self.focus < BODY => {
+                self.sel = Some(self.sel.map_or(n - 1, |s| (s + n - 1) % n));
+                return Outcome::None;
+            }
+            KeyCode::Tab if self.focus < BODY => {
+                if !self.accept_completion() {
+                    self.focus_to(self.focus + 1);
+                }
+                return Outcome::None;
+            }
+            KeyCode::BackTab => {
+                self.focus_to(self.focus.saturating_sub(1));
+                return Outcome::None;
+            }
+            // Enter takes the suggestion on screen; otherwise address fields jump to
+            // Subject (Tab visits Cc/Bcc) and Subject drops into the body.
+            KeyCode::Enter if self.focus < BODY => {
+                if !self.accept_completion() {
+                    self.focus_to(if self.focus < SUBJECT { SUBJECT } else { BODY });
+                }
+                return Outcome::None;
+            }
+            KeyCode::Down if self.focus < BODY => {
+                self.focus_to(self.focus + 1);
+                return Outcome::None;
+            }
+            KeyCode::Up if self.focus < BODY => {
+                self.focus_to(self.focus.saturating_sub(1));
+                return Outcome::None;
+            }
+            KeyCode::Up if self.focus == BODY && self.body.cursor().0 == 0 => {
+                self.focus_to(SUBJECT);
+                return Outcome::None;
+            }
+            _ => {}
+        }
+        let _ = shift;
+            // Keep the textarea's emacs-style ctrl keys (^w ^u ^h) but not ones that would
+        // fight the composer (^n ^p move lines, ^m/^j newline in header fields).
+        let t = self.cur();
+        t.input(Input::from(k));
+        Outcome::None
+    }
+
+    fn normal_key(&mut self, k: KeyEvent) -> Outcome {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let visual = self.mode == VMode::Visual;
+        let on_body = self.focus == BODY;
+
+        if let Some(p) = self.pending.take() {
+            return self.pending_key(p, k);
+        }
+
+        let KeyCode::Char(c) = k.code else {
+            match k.code {
+                KeyCode::Esc => {
+                    if visual {
+                        self.cur().cancel_selection();
+                        self.mode = VMode::Normal;
+                    }
+                }
+                KeyCode::Tab => self.focus_to(self.focus + 1),
+                KeyCode::BackTab => self.focus_to(self.focus.saturating_sub(1)),
+                KeyCode::Left => self.cur().move_cursor(CursorMove::Back),
+                KeyCode::Right => self.cur().move_cursor(CursorMove::Forward),
+                KeyCode::Down => return self.normal_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                KeyCode::Up => return self.normal_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                KeyCode::Enter => return self.normal_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                _ => {}
+            }
+            return Outcome::None;
+        };
+
+        if ctrl {
+            match c {
+                'r' => {
+                    self.cur().redo();
+                }
+                'd' if on_body => {
+                    for _ in 0..10 {
+                        self.body.move_cursor(CursorMove::Down)
+                    }
+                }
+                'u' if on_body => {
+                    for _ in 0..10 {
+                        self.body.move_cursor(CursorMove::Up)
+                    }
+                }
+                _ => {}
+            }
+            return Outcome::None;
+        }
+
+        match c {
+            'h' => self.cur().move_cursor(CursorMove::Back),
+            'l' => self.cur().move_cursor(CursorMove::Forward),
+            'j' => {
+                if on_body {
+                    self.body.move_cursor(CursorMove::Down)
+                } else if !visual {
+                    self.focus_to(self.focus + 1)
+                }
+            }
+            'k' => {
+                if on_body && self.body.cursor().0 > 0 {
+                    self.body.move_cursor(CursorMove::Up)
+                } else if !visual && self.focus > 0 {
+                    self.focus_to(self.focus - 1)
+                }
+            }
+            'w' => self.cur().move_cursor(CursorMove::WordForward),
+            'b' => self.cur().move_cursor(CursorMove::WordBack),
+            'e' => self.cur().move_cursor(CursorMove::WordEnd),
+            '0' | '^' => self.cur().move_cursor(CursorMove::Head),
+            '$' => self.cur().move_cursor(CursorMove::End),
+            '}' => self.cur().move_cursor(CursorMove::ParagraphForward),
+            '{' => self.cur().move_cursor(CursorMove::ParagraphBack),
+            'G' => {
+                if on_body {
+                    self.body.move_cursor(CursorMove::Bottom)
+                } else {
+                    self.focus_to(BODY);
+                    self.body.move_cursor(CursorMove::Bottom)
+                }
+            }
+            'g' | 'd' | 'c' | 'y' | 'Z' | 'r' if !visual || c == 'g' => self.pending = Some(c),
+            ':' => self.command = Some(String::new()),
+            'v' => {
+                if visual {
+                    self.cur().cancel_selection();
+                    self.mode = VMode::Normal;
+                } else {
+                    self.cur().start_selection();
+                    self.mode = VMode::Visual;
+                }
+            }
+            'V' if !visual => {
+                let t = self.cur();
+                t.move_cursor(CursorMove::Head);
+                t.start_selection();
+                t.move_cursor(CursorMove::End);
+                self.mode = VMode::Visual;
+            }
+            'y' if visual => {
+                self.cur().copy();
+                self.mode = VMode::Normal;
+            }
+            'd' | 'x' if visual => {
+                self.cur().cut();
+                self.mode = VMode::Normal;
+            }
+            'c' if visual => {
+                self.cur().cut();
+                self.mode = VMode::Insert;
+            }
+            'x' => {
+                self.cur().delete_next_char();
+            }
+            'X' => {
+                self.cur().delete_char();
+            }
+            'D' => {
+                self.cur().delete_line_by_end();
+            }
+            'C' => {
+                self.cur().delete_line_by_end();
+                self.mode = VMode::Insert;
+            }
+            'S' => {
+                let t = self.cur();
+                t.move_cursor(CursorMove::Head);
+                t.delete_line_by_end();
+                self.mode = VMode::Insert;
+            }
+            'J' if on_body => {
+                let t = self.cur();
+                t.move_cursor(CursorMove::End);
+                if t.delete_next_char() {
+                    t.insert_char(' ');
+                }
+            }
+            'p' => self.paste(true),
+            'P' => self.paste(false),
+            'u' => {
+                self.cur().undo();
+            }
+            'i' => self.mode = VMode::Insert,
+            'a' => {
+                self.cur().move_cursor(CursorMove::Forward);
+                self.mode = VMode::Insert;
+            }
+            'I' => {
+                self.cur().move_cursor(CursorMove::Head);
+                self.mode = VMode::Insert;
+            }
+            'A' => {
+                self.cur().move_cursor(CursorMove::End);
+                self.mode = VMode::Insert;
+            }
+            'o' | 'O' if on_body => {
+                let t = self.cur();
+                if c == 'o' {
+                    t.move_cursor(CursorMove::End);
+                    t.insert_newline();
+                } else {
+                    t.move_cursor(CursorMove::Head);
+                    t.insert_newline();
+                    t.move_cursor(CursorMove::Up);
+                }
+                self.mode = VMode::Insert;
+            }
+            _ => {}
+        }
+        Outcome::None
+    }
+
+    fn pending_key(&mut self, p: char, k: KeyEvent) -> Outcome {
+        let KeyCode::Char(c) = k.code else { return Outcome::None };
+        match (p, c) {
+            ('g', 'g') => {
+                if self.focus == BODY && self.body.cursor().0 > 0 {
+                    self.body.move_cursor(CursorMove::Top);
+                } else {
+                    self.focus_to(TO);
+                }
+            }
+            ('Z', 'Z') => return Outcome::Send,
+            ('Z', 'Q') => return Outcome::Discard,
+            ('d', 'd') => self.delete_line(),
+            ('c', 'c') => {
+                let t = self.cur();
+                t.move_cursor(CursorMove::Head);
+                t.delete_line_by_end();
+                self.mode = VMode::Insert;
+            }
+            ('y', 'y') => {
+                let line = {
+                    let t = self.cur();
+                    t.lines()[t.cursor().0].clone()
+                };
+                self.cur().set_yank_text(format!("{line}\n"));
+            }
+            ('d', 'w') => {
+                self.cur().delete_next_word();
+            }
+            ('c', 'w') | ('c', 'e') => {
+                self.cur().delete_next_word();
+                self.mode = VMode::Insert;
+            }
+            ('d', 'b') => {
+                self.cur().delete_word();
+            }
+            ('d', '$') => {
+                self.cur().delete_line_by_end();
+            }
+            ('d', '0') => {
+                self.cur().delete_line_by_head();
+            }
+            ('r', ch) => {
+                let t = self.cur();
+                if t.delete_next_char() {
+                    t.insert_char(ch);
+                    t.move_cursor(CursorMove::Back);
+                }
+            }
+            _ => {}
+        }
+        Outcome::None
+    }
+
+    fn delete_line(&mut self) {
+        let t = self.cur();
+        let (row, _) = t.cursor();
+        let n = t.lines().len();
+        let line = t.lines()[row].clone();
+        if n == 1 {
+            t.move_cursor(CursorMove::Head);
+            t.delete_line_by_end();
+        } else if row + 1 == n {
+            t.move_cursor(CursorMove::Up);
+            t.move_cursor(CursorMove::End);
+            t.start_selection();
+            t.move_cursor(CursorMove::Bottom);
+            t.move_cursor(CursorMove::End);
+            t.cut();
+            t.move_cursor(CursorMove::Head);
+        } else {
+            t.move_cursor(CursorMove::Head);
+            t.start_selection();
+            t.move_cursor(CursorMove::Down);
+            t.move_cursor(CursorMove::Head);
+            t.cut();
+        }
+        t.set_yank_text(format!("{line}\n"));
+    }
+
+    /// Linewise when the yank ends in a newline (from dd/yy), like vim.
+    fn paste(&mut self, after: bool) {
+        let t = self.cur();
+        let text = t.yank_text();
+        if let Some(line) = text.strip_suffix('\n') {
+            if after {
+                t.move_cursor(CursorMove::End);
+                t.insert_newline();
+            } else {
+                t.move_cursor(CursorMove::Head);
+                t.insert_newline();
+                t.move_cursor(CursorMove::Up);
+            }
+            t.set_yank_text(line);
+            t.paste();
+            t.set_yank_text(text);
+            t.move_cursor(CursorMove::Head);
+        } else {
+            if after {
+                t.move_cursor(CursorMove::Forward);
+            }
+            t.paste();
+        }
+    }
+}
+
+/// Soft-wrap one line to `width` columns as (start, end) char ranges. Breaks after the
+/// last space that fits, splitting words only when one is wider than the line. Display
+/// only: the text you send keeps one line per paragraph, so every client wraps it to fit.
+pub fn layout(line: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut w = 0;
+        let mut end = start;
+        let mut last_space = None;
+        while end < chars.len() {
+            let cw = chars[end].width().unwrap_or(0);
+            if w + cw > width {
+                break;
+            }
+            w += cw;
+            if chars[end] == ' ' {
+                last_space = Some(end);
+            }
+            end += 1;
+        }
+        if end < chars.len() {
+            if let Some(sp) = last_space.filter(|&sp| sp > start) {
+                end = sp + 1;
+            } else if end == start {
+                end += 1;
+            }
+        }
+        out.push((start, end));
+        start = end;
+    }
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(c: &mut Composer, keys: &str) {
+        for ch in keys.chars() {
+            let code = match ch {
+                '\x1b' => KeyCode::Esc,
+                '\n' => KeyCode::Enter,
+                ch => KeyCode::Char(ch),
+            };
+            c.key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+    }
+
+    fn new(body: &str) -> Composer {
+        Composer::new("t", Draft { to: "a@b.c".into(), subject: "s".into(), body: body.into(), ..Default::default() })
+    }
+
+    #[test]
+    fn dd_and_p_move_a_line() {
+        let mut c = new("one\ntwo\nthree");
+        press(&mut c, "\x1bddp");
+        assert_eq!(c.body.lines(), ["two", "one", "three"]);
+    }
+
+    #[test]
+    fn soft_wrap_layout() {
+        // Breaks after the last space that fits; nothing is inserted into the text.
+        assert_eq!(layout("the quick brown fox jumps", 10), vec![(0, 10), (10, 20), (20, 25)]);
+        // A word longer than the width is split.
+        assert_eq!(layout("abcdefghijkl", 5), vec![(0, 5), (5, 10), (10, 12)]);
+        assert_eq!(layout("", 5), vec![(0, 0)]);
+        let mut c = new("");
+        press(&mut c, "the quick brown fox jumps over the lazy dog");
+        assert_eq!(c.body.lines(), ["the quick brown fox jumps over the lazy dog"]);
+    }
+
+    #[test]
+    fn insert_and_command() {
+        let mut c = new("hello");
+        press(&mut c, "\x1bAworld\x1b");
+        assert!(c.dirty());
+        press(&mut c, ":q\n");
+        assert!(matches!(c.key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE)), Outcome::None));
+        assert!(matches!(c.key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE)), Outcome::Discard));
+        assert_eq!(c.to_draft().body, "helloworld\n");
+    }
+
+    #[test]
+    fn field_navigation() {
+        let mut c = new("x");
+        assert_eq!(c.focus, BODY);
+        press(&mut c, "\x1bkk");
+        assert_eq!(c.focus, BCC);
+        press(&mut c, "jj");
+        assert_eq!(c.focus, BODY);
+    }
+}

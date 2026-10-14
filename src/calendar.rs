@@ -1,0 +1,326 @@
+//! Calendar events: iCalendar objects from CalDAV, expanded into dated occurrences for
+//! the agenda. Parsing, recurrence (RRULE/RDATE/EXDATE/RECURRENCE-ID) and time zones are
+//! ical-rs's (Pimalaya); this file turns its civil times into local ones and picks out
+//! what the agenda shows.
+
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use ical::component::{IcalComponent, IcalComponentKind, IcalComponentName};
+use ical::param::IcalParam;
+use ical::prop::{IcalPropKind, IcalPropName};
+use ical::recur::set::{IcalRecurSet, IcalRecurZone};
+use ical::recur::IcalRecurDateTime;
+use ical::tree::cst::IcalCst;
+use ical::tz::IcalTz;
+use ical::value::IcalValue;
+
+/// One occurrence on the agenda.
+#[derive(Debug, Clone)]
+pub struct Occurrence {
+    pub calendar: usize,
+    pub uid: String,
+    pub summary: String,
+    pub location: String,
+    pub description: String,
+    pub organizer: String,
+    pub attendees: Vec<String>,
+    pub start: DateTime<Local>,
+    pub end: DateTime<Local>,
+    pub all_day: bool,
+    pub recurring: bool,
+    pub url: String,
+}
+
+fn kind(c: &IcalComponent<'_>) -> Option<IcalComponentKind> {
+    match &c.name {
+        IcalComponentName::Kind(k) => Some(*k),
+        _ => None,
+    }
+}
+
+/// The text of a value, whatever type it was decoded as.
+fn text(v: &IcalValue<'_>) -> String {
+    match v {
+        IcalValue::Text(t) => t.0.to_string(),
+        IcalValue::DateTime(t) => t.0.to_string(),
+        IcalValue::Date(t) => t.0.to_string(),
+        IcalValue::Duration(t) => t.0.to_string(),
+        IcalValue::CalAddress(t) => t.0.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+struct Props {
+    uid: String,
+    summary: String,
+    location: String,
+    description: String,
+    organizer: String,
+    attendees: Vec<String>,
+    url: String,
+    start: Option<(String, Option<String>)>,
+    end: Option<(String, Option<String>)>,
+    duration: Option<String>,
+    recurrence_id: Option<String>,
+    recurring: bool,
+    cancelled: bool,
+}
+
+fn props(c: &IcalComponent<'_>) -> Props {
+    let mut p = Props {
+        uid: String::new(),
+        summary: String::new(),
+        location: String::new(),
+        description: String::new(),
+        organizer: String::new(),
+        attendees: vec![],
+        url: String::new(),
+        start: None,
+        end: None,
+        duration: None,
+        recurrence_id: None,
+        recurring: false,
+        cancelled: false,
+    };
+    for prop in &c.props {
+        let IcalPropName::Kind(k) = &prop.name else { continue };
+        let tzid = prop.params.iter().find_map(|x| match x {
+            IcalParam::TzId(t) => Some(t.to_string()),
+            _ => None,
+        });
+        let cn = prop.params.iter().find_map(|x| match x {
+            IcalParam::Cn(n) => Some(n.to_string()),
+            _ => None,
+        });
+        let v = text(&prop.value);
+        let person = |v: &str| {
+            let addr = v.trim_start_matches("mailto:").trim_start_matches("MAILTO:").to_string();
+            match &cn {
+                Some(n) if !n.is_empty() => format!("{n} <{addr}>"),
+                _ => addr,
+            }
+        };
+        match k {
+            IcalPropKind::Uid => p.uid = v,
+            IcalPropKind::Summary => p.summary = v,
+            IcalPropKind::Location => p.location = v,
+            IcalPropKind::Description => p.description = v,
+            IcalPropKind::Url => p.url = v,
+            IcalPropKind::Organizer => p.organizer = person(&v),
+            IcalPropKind::Attendee => p.attendees.push(person(&v)),
+            IcalPropKind::DtStart => p.start = Some((v, tzid)),
+            IcalPropKind::DtEnd => p.end = Some((v, tzid)),
+            IcalPropKind::Duration => p.duration = Some(v),
+            IcalPropKind::RecurrenceId => p.recurrence_id = Some(v),
+            IcalPropKind::RRule | IcalPropKind::RDate => p.recurring = true,
+            IcalPropKind::Status => p.cancelled = v.eq_ignore_ascii_case("CANCELLED"),
+            _ => {}
+        }
+    }
+    p
+}
+
+/// `YYYYMMDD` or `YYYYMMDDTHHMMSS[Z]` as a civil time.
+fn civil(v: &str) -> Option<IcalRecurDateTime> {
+    let v = v.trim().trim_end_matches(['Z', 'z']);
+    let d = |a: usize, b: usize| v.get(a..b).and_then(|s| s.parse::<u32>().ok());
+    let (y, m, day) = (v.get(0..4)?.parse::<i32>().ok()?, d(4, 6)? as u8, d(6, 8)? as u8);
+    let mut t = IcalRecurDateTime::date(y, m, day);
+    if v.len() >= 15 {
+        t.hour = d(9, 11)? as u8;
+        t.minute = d(11, 13)? as u8;
+        t.second = d(13, 15)? as u8;
+    }
+    Some(t)
+}
+
+/// `PT1H30M`, `P1D`, `-PT15M` in seconds.
+pub fn duration_secs(v: &str) -> Option<i64> {
+    let v = v.trim();
+    let (neg, v) = match v.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, v.strip_prefix('+').unwrap_or(v)),
+    };
+    let v = v.strip_prefix('P')?;
+    let mut total = 0i64;
+    let mut num = String::new();
+    for ch in v.chars() {
+        match ch {
+            'T' => {}
+            '0'..='9' => num.push(ch),
+            unit => {
+                let n: i64 = num.parse().ok()?;
+                num.clear();
+                total += n * match unit {
+                    'W' => 604_800,
+                    'D' => 86_400,
+                    'H' => 3_600,
+                    'M' => 60,
+                    'S' => 1,
+                    _ => return None,
+                };
+            }
+        }
+    }
+    Some(if neg { -total } else { total })
+}
+
+/// A civil time on `zone` as a local date-time. Zones come from the calendar's own
+/// VTIMEZONEs first, then the IANA database; anything unknown is read as local time.
+fn to_local(t: IcalRecurDateTime, zone: &IcalRecurZone, zones: &[IcalTz]) -> Option<DateTime<Local>> {
+    let naive = NaiveDate::from_ymd_opt(t.year, t.month as u32, t.day as u32)?
+        .and_hms_opt(t.hour as u32, t.minute as u32, t.second as u32)?;
+    let utc = |n: NaiveDateTime| Some(Utc.from_utc_datetime(&n).with_timezone(&Local));
+    match zone {
+        IcalRecurZone::Utc => utc(naive),
+        IcalRecurZone::Floating => Local.from_local_datetime(&naive).earliest(),
+        IcalRecurZone::Tz(id) => {
+            if let Some(z) = zones.iter().find(|z| &z.id == id) {
+                if let Some(secs) = z.resolve(t).instant(t) {
+                    return DateTime::from_timestamp(secs, 0).map(|d| d.with_timezone(&Local));
+                }
+            }
+            match id.parse::<chrono_tz::Tz>() {
+                Ok(tz) => tz.from_local_datetime(&naive).earliest().map(|d| d.with_timezone(&Local)),
+                Err(_) => Local.from_local_datetime(&naive).earliest(),
+            }
+        }
+    }
+}
+
+/// Every occurrence of the events in one iCalendar object that overlaps `from..to`.
+pub fn expand(ics: &str, calendar: usize, from: DateTime<Local>, to: DateTime<Local>) -> Vec<Occurrence> {
+    let Ok(cst) = IcalCst::parse(ics) else { return vec![] };
+    let cal = cst.decode();
+    let comps = &cal.components;
+    let zones: Vec<IcalTz> = comps
+        .iter()
+        .filter(|c| kind(c) == Some(IcalComponentKind::VTimezone))
+        .filter_map(IcalTz::of_component)
+        .collect();
+    let events: Vec<&IcalComponent<'_>> = comps.iter().filter(|c| kind(c) == Some(IcalComponentKind::VEvent)).collect();
+
+    let mut out = Vec::new();
+    for master in events.iter().copied().filter(|c| props(c).recurrence_id.is_none()) {
+        let mp = props(master);
+        if mp.cancelled {
+            continue;
+        }
+        let Some((start_raw, _)) = mp.start.clone() else { continue };
+        let all_day = start_raw.trim().len() == 8;
+        let set = IcalRecurSet::of_uid(comps, &mp.uid);
+        let zone = set.zone.clone();
+        // Length of the master: DTEND − DTSTART on the same clock, else DURATION.
+        let length = |p: &Props| -> i64 {
+            let s = p.start.as_ref().and_then(|(v, _)| civil(v));
+            let e = p.end.as_ref().and_then(|(v, _)| civil(v));
+            match (s, e, &p.duration) {
+                (Some(s), Some(e), _) => e.seconds() - s.seconds(),
+                (_, _, Some(d)) => duration_secs(d).unwrap_or(0),
+                _ if all_day => 86_400,
+                _ => 0,
+            }
+        };
+        let master_len = length(&mp);
+        // Overrides, found by the RECURRENCE-ID they carry.
+        let overrides: Vec<(IcalRecurDateTime, Props)> = events
+            .iter()
+            .map(|c| props(c))
+            .filter(|p| p.uid == mp.uid && p.recurrence_id.is_some())
+            .filter_map(|p| Some((civil(p.recurrence_id.as_ref()?)?, p)))
+            .collect();
+
+        for (n, occ) in set.expand().enumerate() {
+            if n > 5000 {
+                break;
+            }
+            let Some(start) = to_local(occ.start, &zone, &zones) else { continue };
+            if start > to {
+                break;
+            }
+            let over = overrides.iter().find(|(id, _)| *id == occ.id).map(|(_, p)| p);
+            if over.is_some_and(|p| p.cancelled) {
+                continue;
+            }
+            let p = over.unwrap_or(&mp);
+            let len = over.map(length).unwrap_or(master_len);
+            let end = start + Duration::seconds(len.max(0));
+            if end < from || (end == from && len > 0) {
+                continue;
+            }
+            out.push(Occurrence {
+                calendar,
+                uid: mp.uid.clone(),
+                summary: if p.summary.is_empty() { "(no title)".into() } else { p.summary.clone() },
+                location: p.location.clone(),
+                description: p.description.clone(),
+                organizer: p.organizer.clone(),
+                attendees: p.attendees.clone(),
+                start,
+                end,
+                all_day,
+                recurring: mp.recurring,
+                url: p.url.clone(),
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
+        Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    const WEEKLY: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\n\
+BEGIN:VEVENT\r\nUID:standup\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000\r\nDTEND:20260105T091500\r\n\
+RRULE:FREQ=WEEKLY;COUNT=5\r\nEXDATE:20260119T090000\r\nSUMMARY:Standup\r\nLOCATION:Room 4\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:standup\r\nDTSTAMP:20260101T000000Z\r\nRECURRENCE-ID:20260126T090000\r\nDTSTART:20260126T140000\r\n\
+DTEND:20260126T150000\r\nSUMMARY:Standup (afternoon)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    #[test]
+    fn expands_rules_exdates_and_overrides() {
+        let o = expand(WEEKLY, 0, local(2026, 1, 1, 0, 0), local(2026, 3, 1, 0, 0));
+        let days: Vec<String> = o.iter().map(|o| o.start.format("%m-%d %H:%M").to_string()).collect();
+        // Five Mondays, minus the 19th, with the 26th moved to the afternoon.
+        assert_eq!(days, ["01-05 09:00", "01-12 09:00", "01-26 14:00", "02-02 09:00"]);
+        assert_eq!(o[2].summary, "Standup (afternoon)");
+        assert_eq!((o[2].end - o[2].start).num_minutes(), 60);
+        assert_eq!((o[0].end - o[0].start).num_minutes(), 15);
+        assert_eq!(o[0].location, "Room 4");
+        assert!(o[0].recurring);
+    }
+
+    #[test]
+    fn window_and_all_day() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTAMP:20260101T000000Z\r\n\
+DTSTART;VALUE=DATE:20260310\r\nDTEND;VALUE=DATE:20260312\r\nSUMMARY:Offsite\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let o = expand(ics, 0, local(2026, 3, 11, 0, 0), local(2026, 3, 20, 0, 0));
+        assert_eq!(o.len(), 1);
+        assert!(o[0].all_day);
+        assert_eq!((o[0].end - o[0].start).num_days(), 2);
+        assert!(expand(ics, 0, local(2026, 4, 1, 0, 0), local(2026, 5, 1, 0, 0)).is_empty());
+    }
+
+    #[test]
+    fn utc_and_named_zones() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:z\r\nDTSTAMP:20260101T000000Z\r\n\
+DTSTART;TZID=America/New_York:20260715T120000\r\nDURATION:PT45M\r\nSUMMARY:Call\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:u\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T160000Z\r\nSUMMARY:Same instant\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let o = expand(ics, 0, local(2026, 7, 1, 0, 0), local(2026, 8, 1, 0, 0));
+        assert_eq!(o.len(), 2);
+        // Noon in New York in July is 16:00 UTC.
+        assert_eq!(o[0].start, o[1].start);
+        assert_eq!((o[0].end - o[0].start).num_minutes(), 45);
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(duration_secs("PT1H30M"), Some(5400));
+        assert_eq!(duration_secs("P1D"), Some(86400));
+        assert_eq!(duration_secs("-PT15M"), Some(-900));
+        assert_eq!(duration_secs("P1W"), Some(604800));
+    }
+}

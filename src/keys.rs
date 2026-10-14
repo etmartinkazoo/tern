@@ -1,0 +1,138 @@
+//! Every shortcut, in one table. The Keys tab in settings is drawn from this, so keep it in
+//! step with `App::on_key` and `Composer::key`.
+
+pub struct Section {
+    pub title: &'static str,
+    pub keys: &'static [(&'static str, &'static str)],
+}
+
+pub const KEYMAP: &[Section] = &[
+    Section {
+        title: "Move",
+        keys: &[
+            ("j k", "down / up (counts work: 5j)"),
+            ("h l", "focus pane left / right"),
+            ("⏎", "open folder, read message"),
+            ("tab ⇧tab", "cycle panes"),
+            ("J K", "next / previous message from any pane"),
+            ("gg G", "top / bottom (12G jumps to row 12)"),
+            ("^d ^u", "half page down / up"),
+            ("^f ^b", "page down / up"),
+            ("space", "page the message, then the next one"),
+            ("zz", "zoom the message full-screen"),
+            ("esc", "clear filter, marks, zoom"),
+        ],
+    },
+    Section {
+        title: "Go to",
+        keys: &[
+            ("gi", "inbox"),
+            ("gs gd", "sent / drafts"),
+            ("ga gt", "archive / trash"),
+            ("gj gf", "junk / flagged"),
+            ("/", "filter as you type; ⏎ also searches the server"),
+            ("$ ^r", "check for mail now"),
+        ],
+    },
+    Section {
+        title: "Triage",
+        keys: &[
+            ("e", "archive"),
+            ("d # del", "trash (deletes for good inside Trash)"),
+            ("!", "junk"),
+            ("M", "move to folder…"),
+            ("s", "flag / unflag"),
+            ("u", "read / unread"),
+            ("x", "mark (actions then apply to all marked)"),
+            ("X", "mark all / clear marks"),
+        ],
+    },
+    Section {
+        title: "Threads",
+        keys: &[
+            ("za", "fold / unfold the conversation"),
+            ("zo zc", "unfold / fold"),
+            ("zM zR", "fold all / unfold all"),
+            ("T", "threads on / off"),
+        ],
+    },
+    Section {
+        title: "Message",
+        keys: &[
+            ("m c", "new message"),
+            ("r R", "reply / reply all"),
+            ("f", "forward (keeps attachments)"),
+            ("H", "show this message as HTML / as text"),
+            ("o", "open the HTML version in the browser"),
+            ("S", "save attachments"),
+            ("U", "unsubscribe (List-Unsubscribe)"),
+            ("A", "add sender to contacts"),
+            ("y", "copy sender's address"),
+            ("gc", "sync contacts now"),
+        ],
+    },
+    Section {
+        title: "Calendar",
+        keys: &[
+            ("C", "switch between mail and calendar"),
+            ("j k", "next / previous event"),
+            ("h l", "previous / next day"),
+            ("H L", "previous / next week"),
+            ("[ ]", "previous / next month"),
+            ("t", "today"),
+            ("space", "show / hide a calendar (sidebar)"),
+            ("/", "filter events"),
+            ("o", "open the event's link"),
+            ("$ ^r", "sync calendars now"),
+        ],
+    },
+    Section {
+        title: "App",
+        keys: &[(",", "settings"), ("?", "this list"), ("q ^c", "quit")],
+    },
+    Section {
+        title: "Composer · insert",
+        keys: &[
+            ("tab", "take suggestion, or next field"),
+            ("⇧tab", "previous field"),
+            ("⏎", "take suggestion, or To → Subject → body"),
+            ("^n ^p ↑↓", "pick a suggestion"),
+            ("^w ^u", "delete word / to start of line"),
+            ("esc", "normal mode"),
+            ("^s", "send"),
+            ("^t", "attach a file"),
+        ],
+    },
+    Section {
+        title: "Composer · normal",
+        keys: &[
+            ("h j k l", "move (j k cross between fields)"),
+            ("w b e", "word forward / back / end"),
+            ("0 ^ $", "line start / end"),
+            ("{ } gg G", "paragraph, top, bottom"),
+            ("i a I A o O", "insert"),
+            ("x X D C S r J", "delete, change, replace, join"),
+            ("dd dw db cc cw", "delete / change line or word"),
+            ("yy p P", "yank line, paste after / before"),
+            ("v V", "visual; then y d c"),
+            ("u ^r", "undo / redo"),
+            ("ZZ :wq ^s", "send"),
+            (":w", "save to Drafts"),
+            ("ZQ :q!", "discard (:q refuses if unsent)"),
+            (":a <file> ^t", "attach"),
+            (":e ^e", "edit in $EDITOR, then come back"),
+            (":to :cc :bcc", "jump to a field"),
+        ],
+    },
+    Section {
+        title: "Settings",
+        keys: &[
+            ("j k", "move"),
+            ("h l tab", "switch tabs"),
+            ("⏎ space", "toggle or edit"),
+            ("+ -", "adjust numbers"),
+            ("/", "filter keys"),
+            ("esc q", "close"),
+        ],
+    },
+];

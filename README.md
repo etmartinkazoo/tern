@@ -1,0 +1,220 @@
+# tern
+
+A dense, vim-driven mail client for the terminal that wears your Omarchy theme.
+
+```
+ tern you@x.com         │ Inbox  412 · 6 unread                  │ Re: Q4 roadmap — final cut before Friday
+▎ Inbox              6  │ ●  Maya Okafor   Re: Q4 roadmap…  03:45 │ From    Maya Okafor <maya@northwind.io>
+  Drafts                │    GitHub        [omarchy] feat…  03:22 │ To      Ted Martin <ted@example.com>
+  Sent                  │ ●  Priya Raman   Contract draft…    Tue │ Date    Wed 14 Oct 2026 03:45
+  Archive               │                                         │ ──────────────────────────────── all
+  Trash                 │                                         │ Hey,
+```
+
+Sidebar · message list (40%) · message (60%). Mail (IMAP + SMTP, with push), a
+multi-account calendar (CalDAV) and contacts (CardDAV). Google and Microsoft sign
+in with OAuth.
+
+The protocol work is done by [Pimalaya](https://github.com/pimalaya)'s libraries:
+`io-imap` (IMAP, IDLE), `io-webdav` (CalDAV/CardDAV discovery and sync),
+`ical-rs` (iCalendar, recurrence, time zones) and `io-oauth` (sign-in). tern
+itself is the interface.
+
+## Run it
+
+```sh
+cargo install --path .     # or: cargo build --release
+tern --demo                # look around with a fake mailbox
+tern --init                # writes ~/.config/tern/config.toml
+tern
+```
+
+## Omarchy
+
+tern reads the active theme from `~/.config/omarchy/current/theme`. It looks for
+`colors.toml`, then `alacritty.toml`, `kitty.conf`, and `ghostty.conf`. When
+`omarchy-theme-set` repoints the symlink, tern picks up the new theme within
+about two seconds, without a restart. Glyphs come from a Nerd Font, which
+Omarchy ships by default (set `icons = false` to turn them off). tern leaves
+the terminal's background alone, so transparency still works
+(`paint_background = true` overrides that).
+
+Other locations: `TERN_THEME_DIR=…` or `[ui] theme_dir`. If no theme is found,
+tern falls back to a built-in Tokyo Night.
+
+## Keys
+
+| move | | triage | |
+|---|---|---|---|
+| `j` `k` | down / up (counts work: `5j`) | `e` | archive |
+| `h` `l` / `⏎` | focus left / right | `d` | trash (purge when already in Trash) |
+| `J` `K` | next / prev message from any pane | `!` | junk |
+| `gg` `G` | top / bottom | `M` | move to folder (fuzzy) |
+| `^d` `^u` `^f` `^b` | half / full page | `s` | flag |
+| `space` | page the message, then go to the next one | `u` | read / unread |
+| `zz` | zoom the message full-screen | `x` / `X` | mark / mark all; actions apply to marks |
+| `gi gs gd ga gt gj gf` | inbox, sent, drafts, archive, trash, junk, flagged | `/` | live filter; `⏎` also searches the server |
+| `$` | check for mail now | `esc` | clear filter / marks / zoom |
+| `za` `zo` `zc` | toggle / open / fold a conversation | `zM` `zR` | fold / unfold all |
+| `T` | threads on / off | | |
+
+| write | |
+|---|---|
+| `m` | new message |
+| `r` `R` `f` | reply / reply all / forward (forward carries attachments) |
+| `H` | show the message as HTML / as text |
+| `o` | open the HTML version in the browser |
+| `S` | save attachments to `download_dir` |
+| `U` | follow List-Unsubscribe |
+| `A` | add the sender to CardDAV |
+| `y` | copy the sender's address (`wl-copy`) |
+| `gc` | sync contacts now |
+
+### Composing
+
+Messages are written in the right-hand column with the list still in view. Fields
+are To, Cc, Subject (Bcc appears when you tab to it) and the body. The body is
+modal like vim. Long lines wrap on screen only; the message goes out with one
+line per paragraph, so phones and desktop clients each wrap it to fit.
+
+| insert | |
+|---|---|
+| `tab` | take the contact suggestion, or go to the next field |
+| `⏎` | take the suggestion, or jump To → Subject → body |
+| `^n` `^p` | pick a suggestion |
+| `esc` | normal mode |
+
+| normal | |
+|---|---|
+| `hjkl` `w b e` `0 $` `gg G` `{ }` | move (`j`/`k` cross between fields) |
+| `i a I A o O` | insert |
+| `x dd dw D cc cw C S r J` | edit |
+| `yy p P` `v V` | yank, paste, visual |
+| `u` `^r` | undo / redo |
+| `ZZ` `:wq` `^s` | send |
+| `:w` | save to Drafts |
+| `ZQ` `:q!` | discard (`:q` refuses if there are unsent changes) |
+| `^t` `:a <file>` | attach |
+| `:e` | edit in `$EDITOR` full screen, then come back |
+
+## Calendar
+
+`C` switches between mail and the calendar. The calendar uses the same three
+panes: your calendars on the left with a small month view, an agenda in the
+middle, and the selected event on the right. Recurring events (with skipped and
+moved instances), all-day and multi-day events, and time zones are handled. Each
+calendar keeps the color the server gives it.
+
+| | |
+|---|---|
+| `j` `k` | next / previous event |
+| `h` `l` · `H` `L` · `[` `]` | day · week · month |
+| `t` | today |
+| `space` (sidebar) | show / hide a calendar |
+| `/` | filter events |
+| `o` | open the event's link (video call, etc.) |
+| `$` | sync now (it also syncs every 15 minutes) |
+
+Add one `[[dav]]` block per server. tern finds every calendar and address book
+on that server:
+
+```toml
+[[dav]]
+name = "Fastmail"
+url = "https://caldav.fastmail.com/"
+username = "you@example.com"
+password_cmd = "pass show mail/personal"   # or: account = "Personal" to reuse its sign-in
+```
+
+Syncing only downloads what changed since the last sync when the server
+supports that, and the result is cached, so the calendar opens instantly and
+works offline. The calendar is read-only for now.
+
+## OAuth (Gmail, Outlook)
+
+```toml
+[accounts.oauth]
+provider = "google"          # or "microsoft" (tenant = "…" for work accounts)
+client_id = "…"
+client_secret_cmd = "pass show oauth/google-secret"
+```
+
+Run `tern auth <account name>` once. It opens the provider's sign-in page in
+your browser and saves the tokens to `~/.local/share/tern/oauth/` (only you can
+read them). After that, IMAP, SMTP and the account's CalDAV/CardDAV refresh the
+token on their own. You need your own OAuth client: a Google Cloud "desktop
+app", or an Azure app registration with `http://localhost` as the redirect URI.
+Microsoft 365 calendars use Graph rather than CalDAV and aren't supported yet.
+
+## HTML mail
+
+Mail is shown as plain text. `H` switches the current message to its HTML part,
+laid out for the terminal: headings, bold and italics, links, lists, code and
+tables keep their shape. Colors from the email are left out so it stays readable
+on a dark theme. `o` still opens the real thing in your browser.
+
+## Settings and mouse
+
+`,` opens settings, and `?` opens it at the Keys tab. The four tabs:
+
+- **General:** threads, folding, mark-read delay, layout widths, icons,
+  background, mouse, date format, download folder and editor. Changes apply
+  immediately and are saved to `config.toml`; your comments and layout there
+  are kept.
+- **Accounts:** servers, connection state, folders and contacts (read-only;
+  credentials stay in the file).
+- **Keys:** every shortcut. `/` filters the list.
+- **Theme:** the active Omarchy theme, its palette and a preview.
+
+Mouse:
+
+- Click a folder to open it, or a message to select it.
+- Double-click a message (or a folded thread) to read it.
+- The wheel scrolls whichever pane it's over. Scrolling the list doesn't
+  change which message is selected.
+- In settings, click a tab or a switch. Click a value twice to edit it.
+- Shift-drag still selects text in most terminals. Turn **Mouse** off in
+  settings for the terminal's plain selection.
+
+## Threads
+
+Messages are grouped into conversations from Message-ID, In-Reply-To and
+References. When those headers are missing, a message whose subject starts
+with "Re:" joins the oldest thread with the same subject. Each conversation is
+one row in the list: who took part, how many messages, and the latest date. A
+new reply moves the whole thread back to the top. When a folded conversation is
+selected, the right pane shows the whole thread, oldest message first. Unread
+messages and the latest one are shown in full, the others shrink to one line,
+and quoted text is hidden because the earlier messages are already above it.
+
+Archive, delete, junk, move, read/unread and `x` act on the whole conversation.
+`s` flags only the latest message. `za` unfolds a thread into a tree so you can
+act on one message. Set `collapse_threads = false` to start with every thread
+unfolded, or `threads = false` for a flat list.
+
+Your own replies show up only if they are in the folder you're viewing. tern
+doesn't merge in your Sent folder yet.
+
+## How it behaves
+
+- Messages are marked read after they've been open for `mark_read_ms` (800 by
+  default), so skimming with `j` doesn't mark everything read.
+- Archive, delete and move update the list immediately and the server
+  catches up in the background. Each account runs on its own connection
+  task, and a dropped connection is reopened and the command retried once.
+- New mail is pushed: a second connection waits in IMAP IDLE on the open
+  folder, so messages appear as they arrive. Servers without IDLE are checked
+  every `poll_secs`. A refresh keeps your cursor on the same message.
+- Sent mail is saved to the Sent folder (`save_sent = false` for Gmail).
+  Replies set `\Answered` on the original. If sending fails, the draft comes
+  back to the review screen.
+- Contacts are cached in `~/.cache/tern/contacts.json` and refreshed hourly.
+  `tern query <text>` prints mutt-style query output, so an editor plugin can
+  complete addresses too.
+- Passwords come from `password_cmd` (`pass`, `secret-tool`, `op read`, …) or
+  `password`.
+
+## Not yet
+
+Creating and editing events, replying to meeting invites from mail, Microsoft
+365 calendars (Graph), PGP, and sending HTML.
