@@ -71,6 +71,8 @@ pub struct Occurrence {
     pub all_day: bool,
     pub recurring: bool,
     pub url: String,
+    /// Seconds before the start the event's own alarm fires (its first VALARM).
+    pub alarm: Option<i64>,
 }
 
 fn kind(c: &IcalComponent<'_>) -> Option<IcalComponentKind> {
@@ -160,6 +162,25 @@ fn props(c: &IcalComponent<'_>) -> Props {
         }
     }
     p
+}
+
+/// How long before the start the first display/audio alarm fires, from a relative
+/// TRIGGER such as `-PT15M` (absolute triggers are ignored).
+fn alarm_before(event: &IcalComponent<'_>) -> Option<i64> {
+    for child in &event.components {
+        if kind(child) != Some(IcalComponentKind::VAlarm) {
+            continue;
+        }
+        for prop in &child.props {
+            if let IcalPropName::Kind(IcalPropKind::Trigger) = &prop.name {
+                let v = text(&prop.value);
+                if let Some(secs) = duration_secs(&v) {
+                    return Some(-secs);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `YYYYMMDD` or `YYYYMMDDTHHMMSS[Z]` as a civil time.
@@ -264,6 +285,7 @@ pub fn expand(ics: &str, item: &str, calendar: usize, from: DateTime<Tz>, to: Da
             }
         };
         let master_len = length(&mp);
+        let alarm = alarm_before(master);
         // Overrides, found by the RECURRENCE-ID they carry.
         let overrides: Vec<(IcalRecurDateTime, Props)> = events
             .iter()
@@ -316,6 +338,7 @@ pub fn expand(ics: &str, item: &str, calendar: usize, from: DateTime<Tz>, to: Da
                 all_day,
                 recurring: mp.recurring,
                 url: p.url.clone(),
+                alarm: alarm,
             });
         }
     }
@@ -370,6 +393,15 @@ BEGIN:VEVENT\r\nUID:u\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T160000Z\r\
         // Noon in New York in July is 16:00 UTC.
         assert_eq!(o[0].start, o[1].start);
         assert_eq!((o[0].end - o[0].start).num_minutes(), 45);
+    }
+
+    #[test]
+    fn reads_alarms() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTAMP:20260101T000000Z\r\n\
+DTSTART:20260715T160000Z\r\nSUMMARY:x\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let o = expand(ics, "i", 0, local(2026, 7, 1, 0, 0), local(2026, 8, 1, 0, 0));
+        assert_eq!(o[0].alarm, Some(900));
+        assert_eq!(expand(WEEKLY, "i", 0, local(2026, 1, 1, 0, 0), local(2026, 1, 8, 0, 0))[0].alarm, None);
     }
 
     #[test]

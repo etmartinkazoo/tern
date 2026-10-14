@@ -214,6 +214,13 @@ pub struct Ui {
     /// Seconds a sent message waits in the outbox, undoable with ^z. 0 sends at once.
     #[serde(default = "undo_send")]
     pub undo_send_secs: u64,
+    /// Desktop notifications for new mail and upcoming meetings.
+    #[serde(default = "yes")]
+    pub notifications: bool,
+    /// Minutes before a meeting to remind you, when it has no alarm of its own. 0 = only
+    /// events' own alarms.
+    #[serde(default = "reminder_minutes")]
+    pub reminder_minutes: u64,
     /// Your personal Zoom meeting link, put on events with `gz`.
     #[serde(default)]
     pub zoom_link: Option<String>,
@@ -251,6 +258,9 @@ fn sidebar() -> u16 {
 }
 fn list_pct() -> u16 {
     40
+}
+fn reminder_minutes() -> u64 {
+    10
 }
 fn undo_send() -> u64 {
     10

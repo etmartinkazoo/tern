@@ -12,6 +12,7 @@ mod demo;
 mod imap;
 mod meet;
 mod model;
+mod notify;
 mod oauth;
 mod outbox;
 mod drafts;

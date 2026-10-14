@@ -165,6 +165,11 @@ pub struct App {
     pub people: crate::people::PeopleState,
     /// The settings view, set aside while an account form is open over it.
     pub parked_settings: Option<Box<Settings>>,
+    /// Folders already loaded once (mail arriving after that is "new"), meetings
+    /// already reminded of, and when reminders were last checked.
+    loaded_once: HashSet<(usize, String)>,
+    reminded: HashSet<(String, i64)>,
+    last_reminder_check: Instant,
     /// Unified inbox bookkeeping: view ids ⇄ (account, uid), per-account totals.
     ids: HashMap<(usize, u32), u32>,
     rev: HashMap<u32, (usize, u32)>,
@@ -245,6 +250,9 @@ impl App {
             people: Default::default(),
             collapsed: load_ui_state(),
             undo: None,
+            loaded_once: HashSet::new(),
+            reminded: HashSet::new(),
+            last_reminder_check: Instant::now(),
             ids: HashMap::new(),
             rev: HashMap::new(),
             next_id: 0,
@@ -288,6 +296,11 @@ impl App {
             self.open_folder(UNIFIED, "INBOX".into());
         } else if !self.accts.is_empty() {
             self.open_folder(0, "INBOX".into());
+        }
+        // Calendars sync in the background from the start, for reminders and the
+        // mail view's agenda.
+        if !self.cfg.dav_sources().is_empty() || self.demo {
+            self.sync_calendars();
         }
         let stale = contacts::cache_age().is_none_or(|a| a > Duration::from_secs(3600));
         if stale {
@@ -741,7 +754,7 @@ impl App {
             }
             Event::Envelopes { acct, folder, items, total } => {
                 let merge = self.unified() && folder == "INBOX";
-                if self.current.as_ref() != Some(&(acct, folder)) && !merge {
+                if self.current.as_ref() != Some(&(acct, folder.clone())) && !merge {
                     return;
                 }
                 let keep = self.cursor_candidates();
@@ -753,6 +766,20 @@ impl App {
                 }
                 let before: HashSet<u32> = self.all.iter().map(|e| e.uid).collect();
                 let new = items.iter().filter(|e| !e.seen && !before.contains(&e.uid)).count();
+                // Notify only for mail that arrived after this folder was first loaded.
+                let first_load = self.loaded_once.insert((acct, folder.clone()));
+                if !first_load && self.cfg.ui.notifications && folder.eq_ignore_ascii_case("INBOX") {
+                    let fresh_mail: Vec<&Envelope> = items.iter().filter(|e| !e.seen && !before.contains(&e.uid)).collect();
+                    match fresh_mail.as_slice() {
+                        [] => {}
+                        [e] => crate::notify::send(&format!("{} · {}", e.sender(), self.accts[acct].cfg.name), &e.subject, "mail-unread"),
+                        many => crate::notify::send(
+                            &format!("{} new messages · {}", many.len(), self.accts[acct].cfg.name),
+                            &many.iter().take(4).map(|e| format!("{}: {}", e.sender(), e.subject)).collect::<Vec<_>>().join("\n"),
+                            "mail-unread",
+                        ),
+                    }
+                }
                 if merge {
                     // Replace this account's part of the unified list, newest first overall.
                     self.all.retain(|e| e.acct != acct);
@@ -939,8 +966,50 @@ impl App {
         if self.cal.synced_at.is_some_and(|t| t.elapsed() > Duration::from_secs(900)) {
             self.sync_calendars();
         }
+        if self.last_reminder_check.elapsed() >= Duration::from_secs(20) {
+            self.last_reminder_check = Instant::now();
+            self.remind();
+        }
         if !self.error && self.status_at.elapsed() > Duration::from_secs(6) && !self.status.is_empty() {
             self.status.clear();
+        }
+    }
+
+    /// Notify for meetings about to start: at the event's own alarm, else
+    /// `reminder_minutes` before. Each occurrence once.
+    fn remind(&mut self) {
+        if !self.cfg.ui.notifications || self.cal.calendars.is_empty() {
+            return;
+        }
+        if self.cal.occ.is_empty() {
+            self.cal.expand();
+        }
+        let now = crate::calendar::now();
+        let default = self.cfg.ui.reminder_minutes as i64 * 60;
+        let mut due = Vec::new();
+        for o in &self.cal.occ {
+            if o.all_day || o.start <= now {
+                continue;
+            }
+            let lead = match o.alarm {
+                Some(a) => a,
+                None if default > 0 => default,
+                None => continue,
+            };
+            let left = (o.start - now).num_seconds();
+            let key = (o.uid.clone(), o.start.timestamp());
+            if left <= lead && !self.reminded.contains(&key) {
+                due.push((key, o.clone(), left));
+            }
+        }
+        for (key, o, left) in due {
+            self.reminded.insert(key);
+            let mins = (left + 59) / 60;
+            let mut body = format!("in {mins} min · {}", o.start.format("%H:%M"));
+            if !o.location.is_empty() {
+                body.push_str(&format!("\n{}", o.location));
+            }
+            crate::notify::send(&o.summary, &body, "x-office-calendar");
         }
     }
 
