@@ -182,9 +182,8 @@ pub fn persist(path: &PathBuf, key: &str, value: toml_edit::Item) -> Result<()> 
     } else {
         ui[key] = value;
     }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string())?;
-    std::fs::rename(&tmp, path)?;
+    // config.toml can hold passwords: keep it owner-only.
+    crate::private::write(path, doc.to_string())?;
     Ok(())
 }
 

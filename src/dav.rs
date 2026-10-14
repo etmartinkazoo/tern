@@ -303,10 +303,8 @@ pub fn load_cache() -> Vec<CachedCalendar> {
 }
 
 fn save_cache(c: &[CachedCalendar]) -> Result<()> {
-    std::fs::create_dir_all(cache_dir())?;
-    let tmp = cache_file().with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(c)?)?;
-    std::fs::rename(tmp, cache_file())?;
+    crate::private::dir(&cache_dir())?;
+    crate::private::write(&cache_file(), serde_json::to_vec(c)?)?;
     Ok(())
 }
 

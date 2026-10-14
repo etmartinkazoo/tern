@@ -21,14 +21,8 @@ fn path() -> PathBuf {
 
 pub fn save(s: &Saved) {
     let p = path();
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let tmp = p.with_extension("json.tmp");
     if let Ok(bytes) = serde_json::to_vec(s) {
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(tmp, p);
-        }
+        let _ = crate::private::write(&p, bytes);
     }
 }
 

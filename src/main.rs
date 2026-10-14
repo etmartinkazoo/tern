@@ -19,6 +19,7 @@ mod outbox;
 mod drafts;
 mod keys;
 mod parse;
+mod private;
 mod people;
 mod settings;
 mod snooze;
@@ -72,6 +73,7 @@ password = "demo"
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    private::harden();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut demo = false;
     let mut cfg_path = config::default_path();
@@ -144,8 +146,8 @@ fn init(path: &PathBuf) -> Result<()> {
         println!("{} already exists — leaving it alone", path.display());
         return Ok(());
     }
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(path, config::EXAMPLE)?;
+    private::dir(path.parent().unwrap())?;
+    private::write(path, config::EXAMPLE)?;
     println!("wrote {} — fill in your servers, then run `tern`", path.display());
     Ok(())
 }
@@ -301,10 +303,10 @@ fn handle_input(app: &mut App, ev: CEvent) {
 /// Write the draft to a file, run the editor on it, and read it back.
 fn edit(app: &App, d: &compose::Draft, from: &str) -> Result<Option<String>> {
     let dir = config::cache_dir().join("drafts");
-    std::fs::create_dir_all(&dir)?;
+    private::dir(&dir)?;
     let path = dir.join(format!("tern-{}.eml", uuid::Uuid::new_v4()));
     let text = d.to_file_text(from);
-    std::fs::write(&path, &text)?;
+    private::write(&path, &text)?;
 
     let editor = app
         .cfg

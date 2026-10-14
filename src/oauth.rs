@@ -101,15 +101,8 @@ pub fn stored(account: &str) -> Option<bool> {
 
 fn save(account: &str, t: &Tokens) -> Result<()> {
     let path = token_file(account);
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all(&serde_json::to_vec(t)?)?;
-    }
-    std::fs::rename(tmp, path)?;
+    crate::private::dir(path.parent().unwrap())?;
+    crate::private::write(&path, serde_json::to_vec(t)?)?;
     Ok(())
 }
 

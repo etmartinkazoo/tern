@@ -1761,12 +1761,12 @@ impl App {
     fn open_html(&mut self) {
         let Some(b) = &self.body else { return };
         let dir = crate::config::cache_dir().join("view");
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = crate::private::dir(&dir);
         let path = dir.join(format!("{}.html", b.uid));
         let html = b.html.clone().unwrap_or_else(|| {
             format!("<pre style=\"white-space:pre-wrap;font:14px monospace\">{}</pre>", html_escape(&b.text))
         });
-        match std::fs::write(&path, html) {
+        match crate::private::write(&path, html) {
             Ok(()) => self.actions.push(Action::Open(path.to_string_lossy().into_owned())),
             Err(e) => self.fail(format!("{e}")),
         }
@@ -3072,8 +3072,7 @@ fn load_ui_state() -> HashSet<String> {
 }
 
 fn save_ui_state(collapsed: &HashSet<String>) {
-    let _ = std::fs::create_dir_all(crate::config::cache_dir());
-    let _ = std::fs::write(ui_state_file(), serde_json::json!({ "collapsed": collapsed }).to_string());
+    let _ = crate::private::write(&ui_state_file(), serde_json::json!({ "collapsed": collapsed }).to_string());
 }
 
 fn html_escape(s: &str) -> String {

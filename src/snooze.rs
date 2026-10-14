@@ -27,12 +27,5 @@ pub fn load() -> Vec<Snoozed> {
 }
 
 pub fn save(v: &[Snoozed]) {
-    let p = path();
-    if let Some(d) = p.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let tmp = p.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_vec_pretty(v).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(tmp, p);
-    }
+    let _ = crate::private::write(&path(), serde_json::to_vec_pretty(v).unwrap_or_default());
 }

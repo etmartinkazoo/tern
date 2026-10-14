@@ -118,8 +118,8 @@ pub fn cache_age() -> Option<std::time::Duration> {
 }
 
 pub fn save_cache(c: &[Contact]) -> Result<()> {
-    std::fs::create_dir_all(cache_dir())?;
-    std::fs::write(cache_file(), serde_json::to_vec(c)?)?;
+    crate::private::dir(&cache_dir())?;
+    crate::private::write(&cache_file(), serde_json::to_vec(c)?)?;
     Ok(())
 }
 

@@ -47,15 +47,13 @@ pub fn now() -> i64 {
 
 /// Save a message to the outbox (bytes first, then the record that makes it visible).
 pub fn put(q: &Queued, raw: &[u8]) -> Result<()> {
-    std::fs::create_dir_all(dir())?;
-    std::fs::write(eml_path(&q.id), raw).context("writing to the outbox")?;
+    crate::private::dir(&dir())?;
+    crate::private::write(&eml_path(&q.id), raw).context("writing to the outbox")?;
     save(q)
 }
 
 pub fn save(q: &Queued) -> Result<()> {
-    let tmp = meta_path(&q.id).with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(q)?)?;
-    std::fs::rename(tmp, meta_path(&q.id))?;
+    crate::private::write(&meta_path(&q.id), serde_json::to_vec_pretty(q)?)?;
     Ok(())
 }
 

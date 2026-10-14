@@ -380,9 +380,7 @@ pub fn remove(text: &str, i: usize, name: &str) -> Result<String> {
 pub fn save(path: &Path, text: &str) -> Result<()> {
     // Refuse to write something we can't read back.
     toml::from_str::<Config>(text).context("the result wouldn't parse; not saved")?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(tmp, path)?;
+    crate::private::write(path, text)?;
     Ok(())
 }
 
