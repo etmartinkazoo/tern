@@ -344,7 +344,7 @@ impl Worker {
     }
 
     async fn run(&mut self, cmd: Cmd) {
-        let desc = format!("{cmd:?}").chars().take(60).collect::<String>();
+        let desc = cmd.label();
         // One retry after a reconnect: servers drop idle connections all the time.
         for attempt in 0..2 {
             if self.conn.is_none() {

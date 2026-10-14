@@ -95,7 +95,7 @@ pub const KEYMAP: &[Section] = &[
     },
     Section {
         title: "App",
-        keys: &[(",", "settings"), ("?", "this list"), ("q ^c", "quit")],
+        keys: &[(",", "settings"), ("?", "this list"), ("q ^c", "quit"), ("^z", "undo send (a few seconds after sending)"), ("go", "outbox: queued and failed messages")],
     },
     Section {
         title: "Composer · insert",

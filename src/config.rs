@@ -211,6 +211,9 @@ pub struct Ui {
     /// Calendar times are shown and entered in this zone (IANA name or est/pst/…).
     #[serde(default = "calendar_timezone")]
     pub calendar_timezone: String,
+    /// Seconds a sent message waits in the outbox, undoable with ^z. 0 sends at once.
+    #[serde(default = "undo_send")]
+    pub undo_send_secs: u64,
     /// Your personal Zoom meeting link, put on events with `gz`.
     #[serde(default)]
     pub zoom_link: Option<String>,
@@ -248,6 +251,9 @@ fn sidebar() -> u16 {
 }
 fn list_pct() -> u16 {
     40
+}
+fn undo_send() -> u64 {
+    10
 }
 fn calendar_timezone() -> String {
     "America/New_York".into()

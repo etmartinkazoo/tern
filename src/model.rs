@@ -106,6 +106,22 @@ pub enum Cmd {
     Poll { folder: String },
 }
 
+impl Cmd {
+    /// A short description for error messages (never the message bytes).
+    pub fn label(&self) -> String {
+        match self {
+            Cmd::Folders => "listing folders".into(),
+            Cmd::Select { folder } | Cmd::Poll { folder } => format!("opening {folder}"),
+            Cmd::Body { .. } | Cmd::Bodies { .. } => "fetching a message".into(),
+            Cmd::SetFlag { flag, .. } => format!("setting {flag}"),
+            Cmd::Move { to, .. } => format!("moving to {to}"),
+            Cmd::Expunge { .. } => "deleting".into(),
+            Cmd::Append { folder, .. } => format!("saving to {folder}"),
+            Cmd::Search { .. } => "searching".into(),
+        }
+    }
+}
+
 /// Responses from a worker back to the UI. Every event carries its account index.
 #[derive(Debug)]
 pub enum Event {
@@ -120,12 +136,12 @@ pub enum Event {
     Changed { acct: usize, folder: String },
     SearchResult { acct: usize, folder: String, items: Vec<Envelope>, query: String },
     Contacts(Vec<crate::contacts::Contact>),
-    Sent(String),
     /// Calendars after a sync, and any sources that failed.
     Calendars(Vec<crate::dav::CachedCalendar>, Vec<String>),
     /// A call link was made (or not) for an event.
     CallLink(Result<String, String>, crate::calview::CallTarget),
     /// A calendar write finished: what was done, or why it failed.
     CalWrite(Result<String, String>),
-    SendFailed(Box<crate::compose::Draft>, String),
+    /// The outbox tried a message: sent, or why not.
+    OutboxResult(String, Result<(), String>),
 }

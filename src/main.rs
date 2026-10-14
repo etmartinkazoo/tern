@@ -13,6 +13,8 @@ mod imap;
 mod meet;
 mod model;
 mod oauth;
+mod outbox;
+mod drafts;
 mod keys;
 mod parse;
 mod settings;

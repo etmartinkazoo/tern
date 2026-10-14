@@ -44,6 +44,8 @@ pub struct Prompt {
 pub enum Mode {
     Normal,
     Prompt(Prompt),
+    /// The outbox panel: queued and failed messages, with the selected row.
+    Outbox(usize),
     /// The settings view (with the full key list), over the whole window.
     Settings(Box<Settings>),
     /// Writing a message in the right-hand pane.
@@ -158,6 +160,12 @@ pub struct App {
     pub cal: crate::calview::CalState,
     /// The settings view, set aside while an account form is open over it.
     pub parked_settings: Option<Box<Settings>>,
+    /// The last message sent, still undoable: (outbox id, its composer, when).
+    undo: Option<(String, Box<Composer>, Instant)>,
+    /// Outbox messages currently being sent, and how many are queued.
+    sending: HashSet<String>,
+    pub outbox_count: usize,
+    last_outbox: Instant,
     /// Accounts folded shut in the sidebar, by name; remembered between runs.
     pub collapsed: HashSet<String>,
     /// Where settings are saved; None in demo mode.
@@ -224,6 +232,10 @@ impl App {
             cfg_path: None,
             parked_settings: None,
             collapsed: load_ui_state(),
+            undo: None,
+            sending: HashSet::new(),
+            outbox_count: crate::outbox::list().len(),
+            last_outbox: Instant::now(),
             screen: crate::calview::View::Mail,
             cal: crate::calview::CalState::new(),
             hits: Hits::default(),
@@ -708,7 +720,6 @@ impl App {
                 self.contacts = c;
                 self.say(format!("{n} contacts synced"));
             }
-            Event::Sent(s) => self.say(s),
             Event::Calendars(c, errors) => self.on_calendars(c, errors),
             Event::CallLink(r, target) => self.on_call_link(r, target),
             Event::CalWrite(r) => {
@@ -720,11 +731,7 @@ impl App {
                 self.cal.syncing = false;
                 self.sync_calendars();
             }
-            Event::SendFailed(d, e) => {
-                // Put the draft back on screen so nothing is lost; y retries.
-                self.compose("Retry", *d);
-                self.fail(e);
-            }
+            Event::OutboxResult(id, r) => self.on_outbox_result(id, r),
         }
     }
 
@@ -747,6 +754,10 @@ impl App {
     }
 
     pub fn on_tick(&mut self) {
+        if self.last_outbox.elapsed() >= Duration::from_secs(1) {
+            self.last_outbox = Instant::now();
+            self.pump_outbox();
+        }
         if let Some((uid, at)) = self.shown {
             let dwell = Duration::from_millis(self.cfg.ui.mark_read_ms);
             if self.selected().map(|e| e.uid) != Some(uid) {
@@ -817,9 +828,13 @@ impl App {
     pub fn on_key(&mut self, k: KeyEvent) {
         match &mut self.mode {
             Mode::Settings(_) => return self.settings_key(k),
+            Mode::Outbox(_) => return self.outbox_key(k),
             Mode::Prompt(_) => return self.prompt_key(k),
             Mode::Compose(_) => return self.compose_key(k),
             Mode::Normal => {}
+        }
+        if ctrl(&k) && k.code == KeyCode::Char('z') {
+            return self.undo_send();
         }
         if self.screen == crate::calview::View::Calendar {
             if self.calendar_key(k) {
@@ -855,6 +870,7 @@ impl App {
                     KeyCode::Char('j') => self.goto_role(Role::Junk),
                     KeyCode::Char('f') => self.goto_role(Role::Flagged),
                     KeyCode::Char('c') => self.sync_contacts(),
+                    KeyCode::Char('o') => self.mode = Mode::Outbox(0),
                     _ => {}
                 }
             } else if p == 'z' {
@@ -2404,9 +2420,12 @@ impl App {
         }
     }
 
+    /// Sending puts the message in the outbox (on disk) with a short undo window; the
+    /// outbox then sends it, retrying on failure. Nothing is lost if the network or
+    /// tern goes away in between.
     fn send_draft(&mut self, c: Box<Composer>) {
         let d = c.to_draft();
-        let a = self.acct_idx();
+        let a = c.from_acct.unwrap_or_else(|| self.acct_idx()).min(self.accts.len() - 1);
         let acct = self.accts[a].cfg.clone();
         let msg = match d.build(&acct) {
             Ok(m) => m,
@@ -2420,28 +2439,156 @@ impl App {
             self.say(format!("demo: would send “{}” to {}", d.subject, d.to));
             return;
         }
-        let sent_folder = acct.save_sent.then(|| self.folder_for(a, Role::Sent)).flatten();
-        let worker = self.accts[a].tx.clone();
-        let source = d.source.clone();
-        let source_tx = source.as_ref().map(|s| self.accts[s.0].tx.clone());
-        let events = self.events_tx.clone();
-        self.say("sending…");
-        tokio::spawn(async move {
-            match compose::send(&acct, msg).await {
-                Ok(raw) => {
-                    if let Some(f) = sent_folder {
-                        let _ = worker.send(Cmd::Append { folder: f, raw, flags: "(\\Seen)" });
-                    }
-                    if let (Some((_, folder, uid)), Some(tx)) = (source, source_tx) {
-                        let _ = tx.send(Cmd::SetFlag { folder, uids: vec![uid], flag: "\\Answered", on: true });
-                    }
-                    let _ = events.send(Event::Sent("sent ✓".into()));
-                }
-                Err(e) => {
-                    let _ = events.send(Event::SendFailed(Box::new(d), format!("send failed: {e:#}")));
-                }
+        let env = msg.envelope();
+        let name = |i: usize| self.accts.get(i).map(|s| s.cfg.name.clone()).unwrap_or_default();
+        let undo = self.cfg.ui.undo_send_secs;
+        let q = crate::outbox::Queued {
+            id: uuid::Uuid::new_v4().to_string(),
+            account: acct.name.clone(),
+            from: env.from().map(|f| f.to_string()).unwrap_or_else(|| acct.email.clone()),
+            to: env.to().iter().map(|t| t.to_string()).collect(),
+            subject: d.subject.clone(),
+            send_after: crate::outbox::now() + undo as i64,
+            attempts: 0,
+            last_error: None,
+            answers: d.source.as_ref().map(|(i, f, u)| (name(*i), f.clone(), *u)),
+            replaces_draft: d.replaces.as_ref().map(|(i, f, u)| (name(*i), f.clone(), *u)),
+        };
+        if let Err(e) = crate::outbox::put(&q, &msg.formatted()) {
+            self.fail(format!("couldn't queue the message: {e:#}"));
+            self.mode = Mode::Compose(c);
+            return;
+        }
+        crate::drafts::clear();
+        if undo > 0 {
+            self.say(format!("sending “{}” in {undo}s · ^z to undo", d.subject));
+            self.undo = Some((q.id, c, Instant::now()));
+        } else {
+            self.say(format!("sending “{}”…", d.subject));
+        }
+        self.outbox_count = crate::outbox::list().len();
+    }
+
+    /// Keys in the outbox panel: ⏎ edit (takes it out of the queue), r retry now,
+    /// d drop, esc close.
+    fn outbox_key(&mut self, k: KeyEvent) {
+        let items = crate::outbox::list();
+        let Mode::Outbox(cur) = &mut self.mode else { return };
+        let n = items.len();
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => *cur = (*cur + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('k') | KeyCode::Up => *cur = cur.saturating_sub(1),
+            KeyCode::Char('r') if n > 0 => {
+                let mut q = items[(*cur).min(n - 1)].clone();
+                q.send_after = 0;
+                let _ = crate::outbox::save(&q);
+                self.say(format!("retrying “{}”…", q.subject));
             }
-        });
+            KeyCode::Char('d') if n > 0 => {
+                let q = &items[(*cur).min(n - 1)];
+                if self.sending.contains(&q.id) {
+                    return self.say("it's being sent right now");
+                }
+                crate::outbox::remove(&q.id);
+                *cur = cur.saturating_sub(1);
+                self.say(format!("dropped “{}”", q.subject));
+            }
+            KeyCode::Enter | KeyCode::Char('e') if n > 0 => {
+                let q = items[(*cur).min(n - 1)].clone();
+                if self.sending.contains(&q.id) {
+                    return self.say("it's being sent right now");
+                }
+                let raw = crate::outbox::raw(&q.id).unwrap_or_default();
+                crate::outbox::remove(&q.id);
+                let mut d = compose::draft_from_raw(&raw);
+                d.source = None;
+                let mut c = Composer::new("Edit queued message", d);
+                c.from_acct = self.accts.iter().position(|s| s.cfg.name == q.account);
+                self.mode = Mode::Compose(Box::new(c));
+            }
+            _ => {}
+        }
+        self.outbox_count = crate::outbox::list().len();
+    }
+
+    /// ^z right after sending: take the message back out of the outbox.
+    fn undo_send(&mut self) {
+        let Some((id, c, at)) = self.undo.take() else {
+            return self.say("nothing to undo");
+        };
+        if self.sending.contains(&id) || at.elapsed() > Duration::from_secs(self.cfg.ui.undo_send_secs.max(1) + 1) {
+            return self.say("too late — it's already on its way");
+        }
+        crate::outbox::remove(&id);
+        self.outbox_count = crate::outbox::list().len();
+        self.mode = Mode::Compose(c);
+        self.say("not sent — back in the composer");
+    }
+
+    /// Send whatever is due in the outbox. Runs every tick; each message is in flight
+    /// at most once.
+    fn pump_outbox(&mut self) {
+        if self.demo {
+            return;
+        }
+        let now = crate::outbox::now();
+        for q in crate::outbox::list() {
+            if q.send_after > now || self.sending.contains(&q.id) {
+                continue;
+            }
+            let Some(acct) = self.cfg.accounts.iter().find(|a| a.name == q.account).cloned() else {
+                continue;
+            };
+            let raw = match crate::outbox::raw(&q.id) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            self.sending.insert(q.id.clone());
+            let tx = self.events_tx.clone();
+            tokio::spawn(async move {
+                let r = compose::send_raw(&acct, &q.from, &q.to, &raw).await.map_err(|e| format!("{e:#}"));
+                let _ = tx.send(Event::OutboxResult(q.id.clone(), r));
+            });
+        }
+    }
+
+    fn on_outbox_result(&mut self, id: String, r: Result<(), String>) {
+        self.sending.remove(&id);
+        let Some(mut q) = crate::outbox::list().into_iter().find(|q| q.id == id) else { return };
+        match r {
+            Ok(()) => {
+                let raw = crate::outbox::raw(&id).unwrap_or_default();
+                crate::outbox::remove(&id);
+                let idx = |name: &str| self.accts.iter().position(|s| s.cfg.name == name);
+                if let Some(a) = idx(&q.account) {
+                    if self.accts[a].cfg.save_sent {
+                        if let Some(f) = self.folder_for(a, Role::Sent) {
+                            self.send(a, Cmd::Append { folder: f, raw, flags: "(\\Seen)" });
+                        }
+                    }
+                }
+                if let Some((acc, folder, uid)) = &q.answers {
+                    if let Some(a) = idx(acc) {
+                        self.send(a, Cmd::SetFlag { folder: folder.clone(), uids: vec![*uid], flag: "\\Answered", on: true });
+                    }
+                }
+                if let Some((acc, folder, uid)) = &q.replaces_draft {
+                    if let Some(a) = idx(acc) {
+                        self.send(a, Cmd::Expunge { folder: folder.clone(), uids: vec![*uid] });
+                    }
+                }
+                self.say(format!("sent ✓ “{}”", q.subject));
+            }
+            Err(e) => {
+                q.attempts += 1;
+                q.last_error = Some(e.clone());
+                q.send_after = crate::outbox::now() + crate::outbox::backoff(q.attempts);
+                let _ = crate::outbox::save(&q);
+                self.fail(format!("“{}” not sent ({e}) — kept in the outbox, retrying in {}s · go to see it", q.subject, crate::outbox::backoff(q.attempts)));
+            }
+        }
+        self.outbox_count = crate::outbox::list().len();
     }
 }
 

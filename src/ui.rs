@@ -140,6 +140,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, status, &t);
 
     match &app.mode {
+        Mode::Outbox(cur) => draw_outbox(f, *cur, area, &t),
         Mode::Prompt(p) if !p.completions.is_empty() => draw_completions(f, app, main, &t),
         _ => {}
     }
@@ -1056,6 +1057,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
             PromptKind::Attach => ("ATTACH", t.yellow),
         },
         Mode::Settings(_) => ("SETTINGS", t.cyan),
+        Mode::Outbox(_) => ("OUTBOX", t.yellow),
         Mode::Compose(c) => match c.mode {
             VMode::Insert => ("INSERT", t.green),
             VMode::Normal => ("NORMAL", t.accent),
@@ -1107,6 +1109,9 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
     if app.zoom {
         spans.push(Span::styled(" zoom ", Style::default().fg(t.cyan)));
     }
+    if app.outbox_count > 0 {
+        spans.push(Span::styled(format!(" ⇡{} ", app.outbox_count), Style::default().fg(t.yellow).add_modifier(Modifier::BOLD)));
+    }
     let right_hint = Span::styled(" ? help ", Style::default().fg(t.subtle));
     let left_w: usize = spans.iter().map(|s| s.content.width()).sum();
     let room = w.saturating_sub(left_w + right_hint.content.width() + 1);
@@ -1116,6 +1121,40 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
     spans.push(Span::raw(" "));
     spans.push(right_hint);
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(t.surface)), r);
+}
+
+fn draw_outbox(f: &mut Frame, cur: usize, area: Rect, t: &Theme) {
+    let items = crate::outbox::list();
+    let w = (area.width * 3 / 4).clamp(40, area.width);
+    let h = (items.len() as u16 + 6).clamp(8, area.height.saturating_sub(4));
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height.saturating_sub(h)) / 3, width: w, height: h };
+    f.render_widget(Clear, r);
+    f.render_widget(Block::default().style(Style::default().bg(t.surface)), r);
+    let inner = Rect { x: r.x + 2, y: r.y + 1, width: r.width.saturating_sub(4), height: r.height.saturating_sub(2) };
+    let mut lines = vec![Line::from(Span::styled("Outbox", Style::default().fg(t.accent).add_modifier(Modifier::BOLD))), Line::from("")];
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled("Empty — everything has been sent.", Style::default().fg(t.subtle))));
+    }
+    let now = crate::outbox::now();
+    for (i, q) in items.iter().enumerate() {
+        let (state, c) = match (&q.last_error, q.send_after - now) {
+            (Some(e), wait) => (format!("failed ×{} · retry in {}s · {}", q.attempts, wait.max(0), e), t.red),
+            (None, wait) if wait > 0 => (format!("sending in {wait}s"), t.yellow),
+            _ => ("sending…".to_string(), t.green),
+        };
+        let mut l = Line::from(vec![
+            Span::styled(pad(&q.subject, 28), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {} ", pad(&q.to.join(", "), 26)), Style::default().fg(t.muted)),
+            Span::styled(fit(&state, inner.width.saturating_sub(57) as usize), Style::default().fg(c)),
+        ]);
+        if i == cur {
+            l = l.style(Style::default().bg(t.sel_bg));
+        }
+        lines.push(l);
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("⏎ edit · r retry now · d drop · esc close", Style::default().fg(t.yellow))));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_completions(f: &mut Frame, app: &App, main: Rect, t: &Theme) {

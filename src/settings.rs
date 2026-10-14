@@ -31,6 +31,7 @@ pub struct Item {
 pub const ITEMS: &[Item] = &[
     Item { section: "Reading", label: "Group into threads", key: "threads", kind: Kind::Bool, help: "One row per conversation, grouped by reply headers. T toggles it for now." },
     Item { section: "Reading", label: "Start threads folded", key: "collapse_threads", kind: Kind::Bool, help: "Show each conversation as one row until za unfolds it." },
+    Item { section: "Writing", label: "Undo send window", key: "undo_send_secs", kind: Kind::Num { min: 0, max: 60, step: 5, unit: "s" }, help: "How long a sent message waits in the outbox before going out; ^z takes it back. 0 sends at once." },
     Item { section: "Reading", label: "Mark read after", key: "mark_read_ms", kind: Kind::Num { min: 0, max: 10_000, step: 100, unit: "ms" }, help: "How long a message must stay open before it counts as read. 0 marks it at once." },
     Item { section: "Calendar", label: "Time zone", key: "calendar_timezone", kind: Kind::Text, help: "Calendar times are shown and entered in this zone. An IANA name (America/New_York, Europe/Berlin) or est, cst, mst, pst, utc; daylight time is handled." },
     Item { section: "Calendar", label: "Zoom link", key: "zoom_link", kind: Kind::Text, help: "Your Personal Meeting Room link (zoom.us/j/…). gz puts it on the selected event; :zoom in the event form, @zoom in quick add." },
@@ -73,6 +74,7 @@ pub fn get(ui: &Ui, key: &str) -> String {
         "threads" => ui.threads.to_string(),
         "collapse_threads" => ui.collapse_threads.to_string(),
         "mark_read_ms" => ui.mark_read_ms.to_string(),
+        "undo_send_secs" => ui.undo_send_secs.to_string(),
         "sidebar_width" => ui.sidebar_width.to_string(),
         "list_percent" => ui.list_percent.to_string(),
         "icons" => ui.icons.to_string(),
@@ -119,6 +121,7 @@ pub fn set(ui: &mut Ui, item: &Item, raw: &str) -> Result<toml_edit::Item> {
             }
             match item.key {
                 "mark_read_ms" => ui.mark_read_ms = v as u64,
+                "undo_send_secs" => ui.undo_send_secs = v as u64,
                 "sidebar_width" => ui.sidebar_width = v as u16,
                 "list_percent" => ui.list_percent = v as u16,
                 _ => bail!("unknown setting"),

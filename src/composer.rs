@@ -77,6 +77,8 @@ pub struct Composer {
     pub source: Option<SourceForm>,
     /// A line of guidance under the title.
     pub note: String,
+    /// The account a message is sent from (None: the open folder's).
+    pub from_acct: Option<usize>,
     pub body: TextArea<'static>,
     pub focus: usize,
     pub mode: VMode,
@@ -121,6 +123,7 @@ impl Composer {
             account: None,
             source: None,
             note: String::new(),
+            from_acct: None,
             body,
             focus,
             mode: VMode::Insert,
@@ -165,6 +168,7 @@ impl Composer {
             account: None,
             source: None,
             note: String::new(),
+            from_acct: None,
             body,
             focus: 0,
             mode: if d.title.is_empty() { VMode::Insert } else { VMode::Normal },
@@ -199,6 +203,7 @@ impl Composer {
             account: Some(form),
             source: None,
             note: note.to_string(),
+            from_acct: None,
             body,
             focus: 0,
             mode: if spec.name.is_empty() { VMode::Insert } else { VMode::Normal },

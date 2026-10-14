@@ -24,6 +24,8 @@ pub struct Draft {
     pub carried: Vec<(String, Vec<u8>)>,
     /// Which flag to set on the source message once sent (`\Answered` for replies).
     pub source: Option<(usize, String, u32)>,
+    /// The server draft this message continues, removed once it's sent.
+    pub replaces: Option<(usize, String, u32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -230,6 +232,37 @@ impl Draft {
     }
 }
 
+/// A message's text back as a draft (editing something queued or saved).
+pub fn draft_from_raw(raw: &[u8]) -> Draft {
+    let Some(m) = mail_parser::MessageParser::default().parse(raw) else { return Draft::default() };
+    let list = |a: Option<&mail_parser::Address>| crate::parse::addr_list(a);
+    let carried = m
+        .attachments()
+        .map(|p| {
+            use mail_parser::MimeHeaders;
+            (p.attachment_name().unwrap_or("attachment").to_string(), p.contents().to_vec())
+        })
+        .collect();
+    Draft {
+        to: list(m.to()),
+        cc: list(m.cc()),
+        bcc: list(m.bcc()),
+        subject: m.subject().unwrap_or("").to_string(),
+        body: m.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
+        in_reply_to: match m.in_reply_to() {
+            mail_parser::HeaderValue::Text(t) => Some(format!("<{t}>")),
+            _ => None,
+        },
+        references: match m.references() {
+            mail_parser::HeaderValue::Text(t) => Some(format!("<{t}>")),
+            mail_parser::HeaderValue::TextList(l) => Some(l.iter().map(|t| format!("<{t}>")).collect::<Vec<_>>().join(" ")),
+            _ => None,
+        },
+        carried,
+        ..Default::default()
+    }
+}
+
 /// The answer to a meeting invitation: a short note for people, and the iTIP REPLY
 /// that calendar software reads (RFC 6047).
 pub fn invite_reply(me: &Account, to: &str, subject: &str, text: &str, ics: String) -> Result<Message> {
@@ -271,6 +304,23 @@ fn mime_for(name: &str) -> ContentType {
 
 /// Send, returning the formatted message so it can be filed in Sent.
 pub async fn send(me: &Account, msg: Message) -> Result<Vec<u8>> {
+    let raw = msg.formatted();
+    let env = msg.envelope().clone();
+    transport(me).await?.send_raw(&env, &raw).await.context("SMTP send")?;
+    Ok(raw)
+}
+
+/// Send bytes already formatted (from the outbox) to an explicit envelope.
+pub async fn send_raw(me: &Account, from: &str, to: &[String], raw: &[u8]) -> Result<()> {
+    let from: lettre::Address = from.parse().map_err(|e| anyhow!("sender `{from}`: {e}"))?;
+    let to: Vec<lettre::Address> =
+        to.iter().map(|t| t.parse().map_err(|e| anyhow!("recipient `{t}`: {e}"))).collect::<Result<_>>()?;
+    let env = lettre::address::Envelope::new(Some(from), to).map_err(|e| anyhow!("{e}"))?;
+    transport(me).await?.send_raw(&env, raw).await.context("SMTP send")?;
+    Ok(())
+}
+
+async fn transport(me: &Account) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
     let c = &me.smtp;
     let (creds, mechanisms) = match crate::auth::login(me, crate::auth::Proto::Smtp).await? {
         crate::auth::Login::Password { user, password } => (Credentials::new(user, password), None),
@@ -285,10 +335,7 @@ pub async fn send(me: &Account, msg: Message) -> Result<Vec<u8>> {
     if let Some(m) = mechanisms {
         builder = builder.authentication(m);
     }
-    let transport = builder.build();
-    let raw = msg.formatted();
-    transport.send(msg).await.context("SMTP send")?;
-    Ok(raw)
+    Ok(builder.build())
 }
 
 #[cfg(test)]
