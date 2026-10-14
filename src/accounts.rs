@@ -26,8 +26,8 @@ pub const PRESETS: &[Preset] = &[
         label: "Fastmail",
         imap: "imap.fastmail.com:993",
         smtp: "smtp.fastmail.com:465",
-        caldav: "https://caldav.fastmail.com/",
-        carddav: "https://carddav.fastmail.com/",
+        caldav: "https://caldav.fastmail.com/dav/",
+        carddav: "https://carddav.fastmail.com/dav/",
         oauth: "",
         save_sent: true,
         note: "Make an app password (Settings → Privacy & Security → Manage app passwords) with mail, contacts and calendars access, and store it in your password manager.",
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(a.imap.secret.password_cmd.as_deref(), Some("pass show mail/fastmail"));
         assert_eq!(cfg.dav.len(), 2);
         assert!(cfg.dav.iter().all(|d| d.account.as_deref() == Some("Personal") && d.username == "ted@fastmail.com"));
-        assert_eq!(Spec::from_config(&cfg, 1).caldav, "https://caldav.fastmail.com/");
+        assert_eq!(Spec::from_config(&cfg, 1).caldav, "https://caldav.fastmail.com/dav/");
     }
 
     #[test]
@@ -464,8 +464,8 @@ mod tests {
 
 /// Servers for the Calendars tab's chooser: (label, URL).
 pub const DAV_PRESETS: &[(&str, &str)] = &[
-    ("Fastmail calendars", "https://caldav.fastmail.com/"),
-    ("Fastmail contacts", "https://carddav.fastmail.com/"),
+    ("Fastmail calendars", "https://caldav.fastmail.com/dav/"),
+    ("Fastmail contacts", "https://carddav.fastmail.com/dav/"),
     ("iCloud calendars", "https://caldav.icloud.com/"),
     ("iCloud contacts", "https://contacts.icloud.com/"),
     ("Google calendar", "https://apidata.googleusercontent.com/caldav/v2/"),

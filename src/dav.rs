@@ -65,7 +65,89 @@ fn client(src: &Source) -> Result<Client> {
     })
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Calendars,
+    Contacts,
+}
+
 impl Client {
+    /// The calendar or address book home, found from the configured URL, else the way
+    /// other clients look: the server's /.well-known redirect (RFC 6764), then /dav/
+    /// and Nextcloud's /remote.php/dav/. Fastmail, for one, answers 404 at its bare
+    /// host but announces /dav/ through .well-known.
+    fn home(&mut self, kind: Kind) -> Result<url::Url> {
+        let first = self.try_home(kind);
+        if first.is_ok() {
+            return first;
+        }
+        let configured = self.c.base_url.clone();
+        let mut candidates = Vec::new();
+        if let Some(loc) = self.well_known(kind) {
+            candidates.push(loc);
+        }
+        candidates.push("/dav/".to_string());
+        candidates.push("/remote.php/dav/".to_string());
+        for path in candidates {
+            let Ok(url) = configured.join(&path) else { continue };
+            if url.path() == configured.path() || url.host_str() != configured.host_str() {
+                continue;
+            }
+            self.c.base_url = url;
+            self.c.principal_url = None;
+            self.c.calendar_home_set = None;
+            self.c.addressbook_home_set = None;
+            if let Ok(h) = self.try_home(kind) {
+                return Ok(h);
+            }
+        }
+        self.c.base_url = configured;
+        first
+    }
+
+    fn try_home(&mut self, kind: Kind) -> Result<url::Url> {
+        match kind {
+            Kind::Calendars => self.call("calendars", |c| c.calendar_home_set()),
+            Kind::Contacts => self.call("address books", |c| c.addressbook_home_set()),
+        }
+    }
+
+    /// Where the server's /.well-known/caldav (or carddav) redirects, if it does.
+    fn well_known(&self, kind: Kind) -> Option<String> {
+        use pimalaya_stream::stream::Stream;
+        use std::io::{Read, Write};
+        let path = match kind {
+            Kind::Calendars => "/.well-known/caldav",
+            Kind::Contacts => "/.well-known/carddav",
+        };
+        let mut s = if self.https {
+            Stream::connect_tls(&self.host, self.port, Default::default()).ok()?
+        } else {
+            Stream::connect_tcp(&self.host, self.port, Default::default()).ok()?
+        };
+        let req = format!(
+            "PROPFIND {path} HTTP/1.1\r\nHost: {}\r\nDepth: 0\r\nContent-Length: 0\r\nUser-Agent: tern\r\nConnection: close\r\n\r\n",
+            self.host
+        );
+        s.write_all(req.as_bytes()).ok()?;
+        let mut head = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 64 * 1024 {
+            let n = s.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            head.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&head);
+        let status = text.split_whitespace().nth(1)?;
+        if !status.starts_with('3') {
+            return None;
+        }
+        text.lines()
+            .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("location")).map(|(_, v)| v.trim().to_string()))
+    }
+
     fn reopen(&mut self) -> Result<()> {
         use pimalaya_stream::stream::Stream;
         let s = if self.https {
@@ -118,7 +200,7 @@ pub fn sync_contacts(sources: &[Source]) -> Result<(Vec<Contact>, Vec<String>)> 
     for src in sources {
         let r: Result<()> = (|| {
             let mut c = client(src)?;
-            c.call("address books", |c| c.addressbook_home_set())?;
+            c.home(Kind::Contacts)?;
             for book in c.call("address books", |c| c.list_addressbooks())? {
                 let cards = c.call(&book.id, |c| c.list_cards(&book.id, &Default::default()))?;
                 for card in cards.cards {
@@ -142,7 +224,7 @@ pub fn sync_contacts(sources: &[Source]) -> Result<(Vec<Contact>, Vec<String>)> 
 /// Create a contact in the first address book of `src`.
 pub fn add_contact(src: &Source, name: &str, email: &str) -> Result<()> {
     let mut c = client(src)?;
-    c.call("address books", |c| c.addressbook_home_set())?;
+    c.home(Kind::Contacts)?;
     let book = c
         .call("address books", |c| c.list_addressbooks())?
         .into_iter()
@@ -237,7 +319,7 @@ fn list_calendars(c: &mut Client) -> Result<Vec<Found>> {
     use io_webdav::rfc4918::{DISPLAYNAME, RESOURCETYPE};
     use std::io::{Read, Write};
 
-    let home = c.call("calendars", |c| c.calendar_home_set())?;
+    let home = c.home(Kind::Calendars)?;
     let auth = c.auth.clone();
     let ms = c.call("calendars", |w| -> std::result::Result<_, String> {
         let mut co = WebdavPropfind::new(&w.base_url, &auth, &w.user_agent.clone(), home.path(), 1, LIST_PROPS);
@@ -442,7 +524,7 @@ fn aim(c: &mut Client, target: &(String, String)) -> Result<String> {
             Ok(remote.clone())
         }
         _ => {
-            c.call("calendars", |c| c.calendar_home_set())?;
+            c.home(Kind::Calendars)?;
             Ok(remote.clone())
         }
     }
