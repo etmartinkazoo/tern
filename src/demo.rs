@@ -234,7 +234,7 @@ pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Eve
                     }
                     let _ = tx.send(Event::Removed { acct: idx, folder, uids });
                 }
-                Cmd::Append { .. } => {}
+                Cmd::Append { .. } | Cmd::Ensure { .. } | Cmd::Unsnooze { .. } => {}
                 Cmd::Search { folder, query } => {
                     let q = query.to_lowercase();
                     let items = boxes

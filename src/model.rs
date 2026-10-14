@@ -105,6 +105,10 @@ pub enum Cmd {
     Expunge { folder: String, uids: Vec<u32> },
     Append { folder: String, raw: Vec<u8>, flags: &'static str },
     Search { folder: String, query: String },
+    /// Create a folder unless it exists.
+    Ensure { folder: String },
+    /// Find a message by Message-ID in `folder` and move it to `to`, unread.
+    Unsnooze { folder: String, message_id: String, to: String },
     Poll { folder: String },
 }
 
@@ -120,6 +124,8 @@ impl Cmd {
             Cmd::Expunge { .. } => "deleting".into(),
             Cmd::Append { folder, .. } => format!("saving to {folder}"),
             Cmd::Search { .. } => "searching".into(),
+            Cmd::Ensure { folder } => format!("creating {folder}"),
+            Cmd::Unsnooze { .. } => "bringing back a snoozed message".into(),
         }
     }
 }
@@ -140,6 +146,8 @@ pub enum Event {
     Contacts(Vec<crate::contacts::Contact>),
     /// Calendars after a sync, and any sources that failed.
     Calendars(Vec<crate::dav::CachedCalendar>, Vec<String>),
+    /// A snoozed message is back (found) or couldn't be found any more.
+    Unsnoozed { acct: usize, message_id: String, found: bool },
     /// Something to tell the user once a background job finishes.
     Note(String),
     /// A call link was made (or not) for an event.

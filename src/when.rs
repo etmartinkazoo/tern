@@ -296,6 +296,53 @@ pub fn find_in(text: &str, today: NaiveDate) -> (Option<NaiveDate>, Option<Naive
     (None, None, None)
 }
 
+/// When a snooze should end: "3h", "2d", "30m", "tomorrow", "tomorrow 9am", "mon",
+/// "oct 20 14:00", "5pm". A day without a time means 8:00 that morning; a time alone
+/// means its next occurrence.
+pub fn until(text: &str, now: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+    if let Some((d, n)) = duration(&words) {
+        if n == words.len() {
+            return Some(now + d);
+        }
+    }
+    let lower = text.to_lowercase();
+    if words.len() == 1 && lower.ends_with('d') && lower[..lower.len() - 1].parse::<i64>().is_ok() {
+        let days: i64 = lower[..lower.len() - 1].parse().ok()?;
+        return Some(now + Duration::days(days));
+    }
+    let today = now.date();
+    let date = date_at(&words, today).map(|(d, _)| d);
+    let t = words.iter().find_map(|w| time(w));
+    let eight = NaiveTime::from_hms_opt(8, 0, 0)?;
+    match (date, t) {
+        (Some(d), Some(t)) => Some(d.and_time(t)),
+        (Some(d), None) => Some(d.and_time(eight)).filter(|x| *x > now).or(Some(d.and_time(eight) + Duration::days(7))),
+        (None, Some(t)) => {
+            let at = today.and_time(t);
+            Some(if at > now { at } else { at + Duration::days(1) })
+        }
+        (None, None) => None,
+    }
+}
+
+/// Snooze choices offered before you type: (label, what it means).
+pub fn snooze_presets(now: chrono::NaiveDateTime) -> Vec<(String, chrono::NaiveDateTime)> {
+    let today = now.date();
+    let eight = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+    let sat = next_weekday(today + Duration::days(1), Weekday::Sat);
+    let mon = next_weekday(today + Duration::days(1), Weekday::Mon);
+    vec![
+        ("later today · 3h".to_string(), now + Duration::hours(3)),
+        ("tomorrow morning".to_string(), (today + Duration::days(1)).and_time(eight)),
+        ("this weekend".to_string(), sat.and_time(NaiveTime::from_hms_opt(9, 0, 0).unwrap())),
+        ("next week".to_string(), mon.and_time(eight)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +395,20 @@ mod tests {
         assert_eq!((s, e), (t(10, 30), t(11, 30)));
         // "may" as a verb isn't a month.
         assert_eq!(find_in("you may want to review this", today()).0, None);
+    }
+
+    #[test]
+    fn snooze_until() {
+        let now = today().and_hms_opt(15, 0, 0).unwrap(); // Wed 15:00
+        let at = |d: i64, h: u32| (today() + Duration::days(d)).and_hms_opt(h, 0, 0).unwrap();
+        assert_eq!(until("3h", now), Some(now + Duration::hours(3)));
+        assert_eq!(until("2d", now), Some(now + Duration::days(2)));
+        assert_eq!(until("tomorrow", now), Some(at(1, 8)));
+        assert_eq!(until("tomorrow 9am", now), Some(at(1, 9)));
+        assert_eq!(until("mon", now), Some(at(5, 8)));
+        assert_eq!(until("5pm", now), Some(at(0, 17)));
+        assert_eq!(until("9am", now), Some(at(1, 9)));
+        assert_eq!(until("whenever", now), None);
     }
 
     #[test]

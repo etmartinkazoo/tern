@@ -20,6 +20,7 @@ mod keys;
 mod parse;
 mod people;
 mod settings;
+mod snooze;
 mod theme;
 mod thread;
 mod ui;

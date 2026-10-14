@@ -11,6 +11,7 @@ use crate::settings::{self, GeneralRow, Settings};
 use crate::thread::{self, Row, RowKind, Thread};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
+use chrono::TimeZone;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -28,6 +29,7 @@ pub enum PromptKind {
     Filter,
     CalFilter,
     PeopleFilter,
+    Snooze,
     QuickAdd,
     ConfirmDelete,
     Move,
@@ -169,6 +171,10 @@ pub struct App {
     /// already reminded of, and when reminders were last checked.
     loaded_once: HashSet<(usize, String)>,
     reminded: HashSet<(String, i64)>,
+    /// Snoozed messages being brought back right now.
+    waking: HashSet<String>,
+    /// Snoozed messages already back (not "new mail").
+    woken: HashSet<String>,
     last_reminder_check: Instant,
     /// Unified inbox bookkeeping: view ids ⇄ (account, uid), per-account totals.
     ids: HashMap<(usize, u32), u32>,
@@ -252,6 +258,8 @@ impl App {
             undo: None,
             loaded_once: HashSet::new(),
             reminded: HashSet::new(),
+            waking: HashSet::new(),
+            woken: HashSet::new(),
             last_reminder_check: Instant::now(),
             ids: HashMap::new(),
             rev: HashMap::new(),
@@ -769,7 +777,9 @@ impl App {
                 // Notify only for mail that arrived after this folder was first loaded.
                 let first_load = self.loaded_once.insert((acct, folder.clone()));
                 if !first_load && self.cfg.ui.notifications && folder.eq_ignore_ascii_case("INBOX") {
-                    let fresh_mail: Vec<&Envelope> = items.iter().filter(|e| !e.seen && !before.contains(&e.uid)).collect();
+                    // A snoozed message coming back has its own notification.
+                    let fresh_mail: Vec<&Envelope> =
+                        items.iter().filter(|e| !e.seen && !before.contains(&e.uid) && !self.woken.contains(&e.message_id)).collect();
                     match fresh_mail.as_slice() {
                         [] => {}
                         [e] => crate::notify::send(&format!("{} · {}", e.sender(), self.accts[acct].cfg.name), &e.subject, "mail-unread"),
@@ -888,6 +898,7 @@ impl App {
             }
             Event::OutboxResult(id, r) => self.on_outbox_result(id, r),
             Event::Note(s) => self.say(s),
+            Event::Unsnoozed { acct, message_id, found } => self.on_unsnoozed(acct, message_id, found),
         }
     }
 
@@ -969,9 +980,88 @@ impl App {
         if self.last_reminder_check.elapsed() >= Duration::from_secs(20) {
             self.last_reminder_check = Instant::now();
             self.remind();
+            self.wake_snoozed();
         }
         if !self.error && self.status_at.elapsed() > Duration::from_secs(6) && !self.status.is_empty() {
             self.status.clear();
+        }
+    }
+
+    /// Snooze choices: the presets, or what the typed text means.
+    fn snooze_choices(&self, input: &str) -> Vec<String> {
+        let now = chrono::Local::now().naive_local();
+        let fmt = |t: chrono::NaiveDateTime| t.format("%a %e %b %H:%M").to_string();
+        if input.trim().is_empty() {
+            return crate::when::snooze_presets(now).into_iter().map(|(l, t)| format!("{l} → {}", fmt(t))).collect();
+        }
+        match crate::when::until(input, now) {
+            Some(t) => vec![format!("{} → {}", input.trim(), fmt(t))],
+            None => vec![],
+        }
+    }
+
+    /// b: hide the targets until a time, in a Snoozed folder on each account.
+    fn snooze(&mut self, text: &str) {
+        let now = chrono::Local::now().naive_local();
+        let presets = crate::when::snooze_presets(now);
+        let until = presets.iter().find(|(l, _)| l == text).map(|(_, t)| *t).or_else(|| crate::when::until(text, now));
+        let Some(until) = until else {
+            return self.say_error(format!("couldn't read “{text}” — try 3h, tomorrow 9am, mon"));
+        };
+        let uids = self.targets();
+        if uids.is_empty() {
+            return;
+        }
+        let ts = chrono::Local.from_local_datetime(&until).earliest().map(|d| d.timestamp()).unwrap_or(0);
+        let mut list = crate::snooze::load();
+        for &v in &uids {
+            let Some(e) = self.all.iter().find(|e| e.uid == v) else { continue };
+            let Some((a, folder, _)) = self.real(v) else { continue };
+            if e.message_id.is_empty() {
+                continue;
+            }
+            list.push(crate::snooze::Snoozed {
+                account: self.accts[a].cfg.name.clone(),
+                message_id: e.message_id.clone(),
+                subject: e.subject.clone(),
+                from: e.sender().to_string(),
+                until: ts,
+                back_to: folder,
+            });
+        }
+        crate::snooze::save(&list);
+        for (a, _, _) in self.route(&uids) {
+            self.send(a, Cmd::Ensure { folder: crate::snooze::FOLDER.into() });
+        }
+        self.move_each(|_, _| Some(crate::snooze::FOLDER.to_string()), "snoozed");
+        self.say(format!("snoozed {} until {}", uids.len(), until.format("%a %e %b %H:%M")));
+    }
+
+    /// Put due snoozes back.
+    fn wake_snoozed(&mut self) {
+        let now = crate::outbox::now();
+        for s in crate::snooze::load().into_iter().filter(|s| s.until <= now) {
+            let Some(a) = self.accts.iter().position(|x| x.cfg.name == s.account) else { continue };
+            if self.waking.insert(s.message_id.clone()) {
+                self.send(a, Cmd::Unsnooze { folder: crate::snooze::FOLDER.into(), message_id: s.message_id.clone(), to: s.back_to.clone() });
+            }
+        }
+    }
+
+    fn on_unsnoozed(&mut self, acct: usize, message_id: String, found: bool) {
+        self.waking.remove(&message_id);
+        let mut list = crate::snooze::load();
+        let account = self.accts.get(acct).map(|a| a.cfg.name.clone()).unwrap_or_default();
+        let Some(pos) = list.iter().position(|s| s.message_id == message_id && s.account == account) else { return };
+        let s = list.remove(pos);
+        crate::snooze::save(&list);
+        if found {
+            self.woken.insert(s.message_id.clone());
+            if self.cfg.ui.notifications {
+                crate::notify::send(&format!("Back: {}", s.subject), &format!("from {} · snoozed mail", s.from), "mail-unread");
+            }
+            self.say(format!("back in your inbox: “{}”", s.subject));
+            self.poll();
         }
     }
 
@@ -1251,6 +1341,13 @@ impl App {
             KeyCode::Char('f') => self.respond(Kind::Forward),
 
             KeyCode::Char('o') => self.open_html(),
+            KeyCode::Char('b') => {
+                if self.targets().is_empty() {
+                    return;
+                }
+                let completions = self.snooze_choices("");
+                self.mode = Mode::Prompt(Prompt { kind: PromptKind::Snooze, input: String::new(), sel: Some(0), completions });
+            }
             KeyCode::Char('H') => self.toggle_html(),
             KeyCode::Char('a') => self.answer_invite("ACCEPTED"),
             KeyCode::Char('t') => self.answer_invite("TENTATIVE"),
@@ -1816,6 +1913,7 @@ impl App {
             PromptKind::Move => self.folder_completions(&input),
             PromptKind::Attach => Self::path_completions(&input),
             PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter | PromptKind::QuickAdd | PromptKind::ConfirmDelete => vec![],
+            PromptKind::Snooze => self.snooze_choices(&input),
         };
         if let Mode::Prompt(p) = &mut self.mode {
             p.sel = match kind {
@@ -1960,6 +2058,10 @@ impl App {
             }
             PromptKind::CalFilter => self.cal_filter(&p.input),
             PromptKind::PeopleFilter => self.people.filter = p.input.trim().to_string(),
+            PromptKind::Snooze => {
+                let text = picked.as_deref().and_then(|c| c.split(" → ").next()).unwrap_or(p.input.trim()).to_string();
+                self.snooze(&text);
+            }
             PromptKind::QuickAdd => self.quick_add(&p.input),
             PromptKind::ConfirmDelete => {}
             PromptKind::Move => {

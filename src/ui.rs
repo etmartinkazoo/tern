@@ -1103,6 +1103,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
         Mode::Prompt(p) => match p.kind {
             PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter => ("SEARCH", t.yellow),
             PromptKind::QuickAdd => ("ADD", t.green),
+            PromptKind::Snooze => ("SNOOZE", t.magenta),
             PromptKind::ConfirmDelete => ("DELETE?", t.red),
             PromptKind::Move => ("MOVE", t.magenta),
             PromptKind::Attach => ("ATTACH", t.yellow),
@@ -1131,6 +1132,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
         let label = match p.kind {
             PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter => " /",
             PromptKind::QuickAdd => " add:",
+            PromptKind::Snooze => " snooze until:",
             PromptKind::ConfirmDelete => "",
             PromptKind::Move => " move to:",
             PromptKind::Attach => " file:",
@@ -1143,6 +1145,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
             PromptKind::CalFilter => "  filters events as you type · esc: clear",
             PromptKind::PeopleFilter => "  name, email, company or phone · esc: clear",
             PromptKind::QuickAdd => "  e.g. Lunch with Maya fri 12:30 1h @Osteria · enter adds",
+            PromptKind::Snooze => "  3h · tomorrow 9am · mon · or pick ↑↓ · enter snoozes",
             PromptKind::ConfirmDelete => "  y deletes · anything else keeps it",
             PromptKind::Move | PromptKind::Attach => "  tab: complete · ↑↓ pick · enter: ok",
         };

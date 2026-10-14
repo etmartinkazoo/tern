@@ -444,6 +444,38 @@ impl Worker {
                 self.c().append(mailbox(folder)?, raw, opts).await?;
                 Ok(())
             }
+            Cmd::Ensure { folder } => {
+                let pattern = ListMailbox::try_from("*").map_err(|e| anyhow!("{e:?}"))?;
+                let exists = self.c().list(mailbox("")?, pattern).await?.iter().any(|(m, _, _)| mailbox_name(m) == *folder);
+                if !exists {
+                    self.c().create(mailbox(folder)?).await?;
+                    self.folders().await?;
+                }
+                Ok(())
+            }
+            Cmd::Unsnooze { folder, message_id, to } => {
+                let (exists, _) = self.select(folder).await?;
+                let mut found = false;
+                if exists > 0 {
+                    let want = message_id.trim_matches(|c| c == '<' || c == '>');
+                    let all = self.fetch_headers(seq("1:*")?, false).await?;
+                    if let Some(e) = all.iter().find(|e| e.message_id.trim_matches(|c| c == '<' || c == '>') == want) {
+                        let set = uid_set(&[e.uid])?;
+                        self.c().store(set.clone(), StoreType::Remove, vec![Flag::Seen], ImapMessageStoreOptions { uid: true }).await?;
+                        if self.c().has("MOVE") {
+                            self.c().r#move(set, mailbox(to)?, ImapMessageMoveOptions { uid: true }).await?;
+                        } else {
+                            self.c().copy(set.clone(), mailbox(to)?, ImapMessageCopyOptions { uid: true }).await?;
+                            self.expunge_uids(set).await?;
+                        }
+                        found = true;
+                    }
+                }
+                self.selected = None;
+                self.last_state = None;
+                self.send(Event::Unsnoozed { acct: self.idx, message_id: message_id.clone(), found });
+                Ok(())
+            }
             Cmd::Search { folder, query } => {
                 self.ensure_selected(folder).await?;
                 let text = query.clone().try_into().map_err(|e| anyhow!("search text: {e:?}"))?;

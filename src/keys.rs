@@ -46,6 +46,7 @@ pub const KEYMAP: &[Section] = &[
             ("M", "move to folder…"),
             ("s", "flag / unflag"),
             ("u", "read / unread"),
+            ("b", "snooze until… (3h, tomorrow 9am, mon)"),
             ("x", "mark (actions then apply to all marked)"),
             ("X", "mark all / clear marks"),
         ],
