@@ -15,6 +15,22 @@ Sidebar · message list (40%) · message (60%). Mail (IMAP + SMTP, with push), a
 multi-account calendar (CalDAV) and contacts (CardDAV). Google and Microsoft sign
 in with OAuth.
 
+Built for getting through a day of business and personal mail:
+
+- **One inbox for every account** (`gu`), and replies go out from the account
+  they came to. `^f` in the composer switches who it's from.
+- **Nothing gets lost.** Sending goes through an outbox: `^z` takes it back for
+  a few seconds, and a send that fails offline is retried until it goes. What
+  you're writing is autosaved and survives a crash.
+- **Snooze** (`b`) hides a message until tomorrow morning, Monday or `3h` from
+  now, then puts it back unread.
+- **Mail and calendar together.** Today's meetings sit under your folders,
+  invitations are answered from the message, `ge` turns an email into an event,
+  and `gm` / `gz` add a Meet or Zoom link.
+- **People** (`P`): each contact with your recent mail and upcoming meetings.
+- **Notifications** for new mail and for meetings about to start.
+- **`tern doctor`** checks every account and server and tells you what's wrong.
+
 The protocol work is done by [Pimalaya](https://github.com/pimalaya)'s libraries:
 `io-imap` (IMAP, IDLE), `io-webdav` (CalDAV/CardDAV discovery and sync),
 `ical-rs` (iCalendar, recurrence, time zones) and `io-oauth` (sign-in). tern
@@ -26,8 +42,15 @@ itself is the interface.
 cargo install --path .     # or: cargo build --release
 tern --demo                # look around with a fake mailbox
 tern --init                # writes ~/.config/tern/config.toml
+tern doctor                # check every account and server
 tern
 ```
+
+`tern doctor` signs in to each IMAP and SMTP server (it sends nothing), checks
+password commands and OAuth tokens, finds the calendars and address books on
+each `[[dav]]` server, and looks at the theme, time zone, editor, helper tools
+and anything stuck in the outbox. Each problem comes with what to do about it,
+and it exits 1 when something fails.
 
 ## Omarchy
 
@@ -54,6 +77,7 @@ tern falls back to a built-in Tokyo Night.
 | `space` | page the message, then go to the next one | `u` | read / unread |
 | `zz` | zoom the message full-screen | `x` / `X` | mark / mark all; actions apply to marks |
 | `gi gs gd ga gt gj gf` | inbox, sent, drafts, archive, trash, junk, flagged | `/` | live filter; `⏎` also searches the server |
+| `gu` | all inboxes, every account in one list | `b` | snooze until… |
 | `$` | check for mail now | `esc` | clear filter / marks / zoom |
 | `za` `zo` `zc` | toggle / open / fold a conversation | `zM` `zR` | fold / unfold all |
 | `T` | threads on / off | | |
@@ -69,6 +93,12 @@ tern falls back to a built-in Tokyo Night.
 | `A` | add the sender to CardDAV |
 | `y` | copy the sender's address (`wl-copy`) |
 | `gc` | sync contacts now |
+| `ge` | make a calendar event from the message |
+| `gr` | resume the message you were writing last time |
+| `go` | outbox: what's waiting to send, and what failed |
+| `^z` | undo the send you just made |
+| `P` | people |
+| `C` | calendar |
 
 ### Composing
 
@@ -96,6 +126,56 @@ line per paragraph, so phones and desktop clients each wrap it to fit.
 | `ZQ` `:q!` | discard (`:q` refuses if there are unsent changes) |
 | `^t` `:a <file>` | attach |
 | `:e` | edit in `$EDITOR` full screen, then come back |
+| `^f` | send from your next account (its signature replaces the old one) |
+
+## Sending, and not losing anything
+
+A sent message goes to the outbox in `~/.local/share/tern/outbox/` before
+anything else happens. It waits `undo_send_secs` (10 by default) so `^z` can
+bring it back into the composer, then goes out. If sending fails (offline, the
+server is down), it stays queued and is retried after 30s, 2m, 10m and then
+every 30 minutes, including after a restart. The status bar shows how many are
+waiting. `go` opens the outbox: `r` retries now, `⏎` edits, `d` discards.
+
+While you write, the composer is saved to `~/.local/share/tern/draft.json`
+every few seconds. If tern closes before you send, the next start tells you,
+and `gr` picks it up where you left off. `:w` saves to the server's Drafts
+folder, and `⏎` on a message in Drafts opens it for editing; sending it
+removes the draft.
+
+## All inboxes
+
+With more than one account, `gu` (or "All inboxes" at the top of the sidebar)
+shows every account's inbox as one list, newest first, with each message
+tagged by account. Everything works as usual: archive, trash and move go to the
+right account's folders, and a reply is sent from the account the message came
+to. `^f` in the composer cycles the From address through your accounts and
+swaps the signature to match.
+
+## Snooze
+
+`b` asks until when: pick later today, tomorrow morning, this weekend or next
+week, or type `3h`, `2d`, `tomorrow 9am`, `fri 2pm`. The message moves to a
+`Snoozed` folder on its server (created the first time), so it's out of your
+inbox on your phone too. When the time comes, and tern is running, it's moved
+back to the inbox, marked unread, with a notification. Snoozes are remembered
+in `~/.local/share/tern/snoozed.json` and caught up on the next start.
+
+## People
+
+`P` opens your contacts from every CardDAV address book. The right pane shows
+the selected person's addresses, phone and notes, your upcoming meetings with
+them, and recent mail from the loaded folders. `m` or `⏎` writes to them, `a`
+adds a contact, `e` edits, `d` deletes (asks first), `y` copies the address and
+`/` filters. Changes are saved to the server. `A` on a message adds its sender.
+
+## Notifications and today
+
+New mail in your inboxes and upcoming meetings show as desktop notifications
+(`notify-send`, which Omarchy's mako displays). A meeting reminds you at its own
+alarm, or `reminder_minutes` before (10 by default). The mail sidebar shows
+today's remaining meetings under your folders; `agenda_in_mail = false` hides
+them. Both can be turned off under Settings → General.
 
 ## Accounts
 
@@ -178,6 +258,11 @@ answer yes / maybe / no. That sends the organizer a standard reply, puts the
 event in your calendar (or takes it out on a no), and marks the message
 answered.
 
+`ge` on any message opens a new event with the subject as the title, the date
+and time if the message mentions them ("Thursday at 3pm"), any Meet, Zoom or
+Teams link in it as the place, and the people on the message and its text in
+the notes, ready to adjust and save.
+
 ## OAuth (Gmail, Outlook)
 
 ```toml
@@ -205,8 +290,10 @@ on a dark theme. `o` still opens the real thing in your browser.
 
 `,` opens settings, and `?` opens it at the Keys tab. The four tabs:
 
-- **General:** threads, folding, mark-read delay, layout widths, icons,
-  background, mouse, date format, download folder and editor. Changes apply
+- **General:** threads, folding, undo-send window, mark-read delay, time zone,
+  today in the sidebar, notifications and reminder time, Zoom link and Meet
+  account, layout widths, icons, background, mouse, date format, download
+  folder and editor. Changes apply
   immediately and are saved to `config.toml`; your comments and layout there
   are kept.
 - **Accounts:** servers, connection state, folders and contacts (read-only;
@@ -254,8 +341,8 @@ doesn't merge in your Sent folder yet.
   folder, so messages appear as they arrive. Servers without IDLE are checked
   every `poll_secs`. A refresh keeps your cursor on the same message.
 - Sent mail is saved to the Sent folder (`save_sent = false` for Gmail).
-  Replies set `\Answered` on the original. If sending fails, the draft comes
-  back to the review screen.
+  Replies set `\Answered` on the original. A send that fails stays in the
+  outbox and is retried.
 - Contacts are cached in `~/.cache/tern/contacts.json` and refreshed hourly.
   `tern query <text>` prints mutt-style query output, so an editor plugin can
   complete addresses too.

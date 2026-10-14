@@ -73,6 +73,7 @@ pub const KEYMAP: &[Section] = &[
             ("U", "unsubscribe (List-Unsubscribe)"),
             ("A", "add sender to contacts"),
             ("ge", "make a calendar event from this message"),
+            ("gr", "resume the unsent message autosaved last time"),
             ("y", "copy sender's address"),
             ("gc", "sync contacts now"),
         ],
