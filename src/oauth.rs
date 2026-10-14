@@ -94,6 +94,11 @@ fn load(account: &str) -> Option<Tokens> {
     serde_json::from_slice(&std::fs::read(token_file(account)).ok()?).ok()
 }
 
+/// For `tern doctor`: whether tokens are stored, and whether they can be refreshed.
+pub fn stored(account: &str) -> Option<bool> {
+    load(account).map(|t| t.refresh_token.is_some())
+}
+
 fn save(account: &str, t: &Tokens) -> Result<()> {
     let path = token_file(account);
     std::fs::create_dir_all(path.parent().unwrap())?;

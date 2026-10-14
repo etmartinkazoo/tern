@@ -9,6 +9,7 @@ mod config;
 mod contacts;
 mod dav;
 mod demo;
+mod doctor;
 mod imap;
 mod meet;
 mod model;
@@ -50,6 +51,7 @@ usage:
   tern query <text>        search contacts (mutt query format, for editor completion)
   tern contacts sync       pull contacts from every [[dav]] source now
   tern auth <account>      sign in with OAuth (Google, Microsoft) in the browser
+  tern doctor              check every account and server, and say what's wrong
 ";
 
 const DEMO_CONFIG: &str = r#"
@@ -111,6 +113,10 @@ async fn main() -> Result<()> {
                 let o = acct.oauth.as_ref().with_context(|| format!("{name} has no [accounts.oauth] section"))?;
                 let (name, o) = (acct.name.clone(), o.clone());
                 return tokio::task::spawn_blocking(move || oauth::authorize(&name, &o)).await?;
+            }
+            "doctor" => {
+                let ok = doctor::run(&cfg_path).await;
+                std::process::exit(if ok { 0 } else { 1 });
             }
             "contacts" if args.get(i + 1).map(|s| s.as_str()) == Some("sync") => {
                 let cfg = config::load(&cfg_path)?;
@@ -339,7 +345,7 @@ fn edit(app: &App, d: &compose::Draft, from: &str) -> Result<Option<String>> {
     Ok(Some(out))
 }
 
-fn on_path(cmd: &str) -> bool {
+pub fn on_path(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
         .unwrap_or(false)

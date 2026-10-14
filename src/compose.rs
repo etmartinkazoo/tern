@@ -320,6 +320,15 @@ pub async fn send_raw(me: &Account, from: &str, to: &[String], raw: &[u8]) -> Re
     Ok(())
 }
 
+/// Connect and sign in without sending anything (`tern doctor`).
+pub async fn check_smtp(me: &Account) -> Result<()> {
+    if transport(me).await?.test_connection().await.context("SMTP")? {
+        Ok(())
+    } else {
+        anyhow::bail!("{} answered but isn't ready", me.smtp.host)
+    }
+}
+
 async fn transport(me: &Account) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
     let c = &me.smtp;
     let (creds, mechanisms) = match crate::auth::login(me, crate::auth::Proto::Smtp).await? {

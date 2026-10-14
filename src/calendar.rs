@@ -338,7 +338,7 @@ pub fn expand(ics: &str, item: &str, calendar: usize, from: DateTime<Tz>, to: Da
                 all_day,
                 recurring: mp.recurring,
                 url: p.url.clone(),
-                alarm: alarm,
+                alarm,
             });
         }
     }

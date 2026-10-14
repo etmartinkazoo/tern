@@ -190,6 +190,17 @@ fn last_segment(href: &str) -> String {
         .unwrap_or_else(|| seg.to_string())
 }
 
+/// For `tern doctor`: how many calendars and address books a source finds, each on its
+/// own so one missing doesn't hide the other.
+pub fn probe(src: &Source) -> (Result<usize>, Result<usize>) {
+    let cals = client(src).and_then(|mut c| list_calendars(&mut c)).map(|v| v.len());
+    let books = client(src).and_then(|mut c| {
+        c.home(Kind::Contacts)?;
+        Ok(c.call("address books", |c| c.list_addressbooks())?.len())
+    });
+    (cals, books)
+}
+
 // ------------------------------------------------------------------- contacts
 
 /// Every card in every address book of every source. A source that fails is reported
