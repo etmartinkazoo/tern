@@ -215,6 +215,61 @@ fn tidy(s: &str) -> String {
     out.trim_matches('\n').to_string()
 }
 
+/// The web links in a message, in reading order, without repeats: every `href` in
+/// the HTML part, then any bare http(s) URL in the text part.
+pub fn links(text: &str, html: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |u: String| {
+        if (u.starts_with("http://") || u.starts_with("https://")) && u.len() > 8 && !out.contains(&u) {
+            out.push(u);
+        }
+    };
+    if let Some(h) = html {
+        let lower = h.to_ascii_lowercase();
+        let mut at = 0;
+        while let Some(i) = lower[at..].find("href") {
+            let rest = &h[at + i + 4..];
+            at += i + 4;
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix('=') else { continue };
+            let rest = rest.trim_start();
+            let (q, rest) = match rest.chars().next() {
+                Some(c @ ('"' | '\'')) => (Some(c), &rest[1..]),
+                _ => (None, rest),
+            };
+            let end = match q {
+                Some(c) => rest.find(c),
+                None => rest.find(|c: char| c.is_whitespace() || c == '>'),
+            };
+            let Some(end) = end else { continue };
+            add(unescape(rest[..end].trim()));
+        }
+    }
+    let starts: std::collections::BTreeSet<usize> =
+        ["http://", "https://"].iter().flat_map(|p| text.match_indices(p).map(|(i, _)| i)).collect();
+    for start in starts {
+        let rest = &text[start..];
+        let end = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '[' | ']')).unwrap_or(rest.len());
+        let mut u = &rest[..end];
+        // Sentence punctuation after a URL, and a closing bracket it doesn't open.
+        loop {
+            let t = u.trim_end_matches(['.', ',', ';', ':', '!', '?', '\'']);
+            let t = if t.ends_with(')') && t.matches('(').count() < t.matches(')').count() { &t[..t.len() - 1] } else { t };
+            if t.len() == u.len() {
+                break;
+            }
+            u = t;
+        }
+        add(u.to_string());
+    }
+    out
+}
+
+/// The HTML entities that turn up inside an href.
+fn unescape(s: &str) -> String {
+    s.replace("&amp;", "&").replace("&#38;", "&").replace("&quot;", "\"").replace("&#61;", "=").replace("&#x3D;", "=")
+}
+
 /// Bytes of the n-th attachment and its file name.
 pub fn attachment_bytes(raw: &[u8], n: usize) -> Option<(String, Vec<u8>)> {
     let msg = MessageParser::default().parse(raw)?;
@@ -233,5 +288,13 @@ mod tests {
         assert_eq!(e.from_name, "Jürgen");
         assert_eq!(e.subject, "Hello world");
         assert!(e.seen && e.has_attachment);
+    }
+
+    #[test]
+    fn finds_links() {
+        let html = r#"<a href="https://a.com/x?y=1&amp;z=2">A</a> <A HREF='http://b.org'>B</A> <a href="mailto:m@x.com">m</a> <a href=https://c.io/p>c</a> <a href="https://a.com/x?y=1&amp;z=2">again</a>"#;
+        assert_eq!(links("", Some(html)), ["https://a.com/x?y=1&z=2", "http://b.org", "https://c.io/p"]);
+        let text = "See https://d.dev/docs. Or (https://e.net/a_(b)) and <https://f.com/q>, http://g.com!";
+        assert_eq!(links(text, None), ["https://d.dev/docs", "https://e.net/a_(b)", "https://f.com/q", "http://g.com"]);
     }
 }

@@ -34,6 +34,8 @@ pub enum PromptKind {
     ConfirmDelete,
     Move,
     Attach,
+    /// Pick one of the message's links to open or copy.
+    Link,
 }
 
 #[derive(Debug)]
@@ -635,6 +637,11 @@ impl App {
         self.view = self.rows.iter().map(|r| r.msg).collect();
     }
 
+    /// Whether the list has focus and the cursor is on a conversation row of one of `kinds`.
+    fn on_thread(&self, kinds: &[RowKind]) -> bool {
+        self.focus == Focus::List && self.rows.get(self.cursor).is_some_and(|r| r.thread != usize::MAX && kinds.contains(&r.kind))
+    }
+
     fn set_fold(&mut self, fold: Option<bool>) {
         let Some(r) = self.rows.get(self.cursor) else { return };
         if r.thread == usize::MAX || r.kind == RowKind::Single {
@@ -945,8 +952,13 @@ impl App {
                     match missing {
                         Some(uids) if !uids.is_empty() => {
                             self.requested = Some(uid);
-                            for (a, f, real) in self.route(&uids) {
-                                self.send(a, Cmd::Bodies { folder: f, uids: real });
+                            // What the reader sees unfolded (unread and the latest) comes in its
+                            // own fetch, ahead of the folded history and its attachments.
+                            let (open, rest): (Vec<u32>, Vec<u32>) = uids.into_iter().partition(|u| self.conv_open.contains(u));
+                            for batch in [open, rest] {
+                                for (a, f, real) in self.route(&batch) {
+                                    self.send(a, Cmd::Bodies { folder: f, uids: real });
+                                }
                             }
                         }
                         Some(_) => {}
@@ -1181,6 +1193,7 @@ impl App {
                     KeyCode::Char('o') => self.mode = Mode::Outbox(0),
                     KeyCode::Char('r') => self.resume_draft(),
                     KeyCode::Char('e') => self.event_from_message(),
+                    KeyCode::Char('x') => self.pick_link(),
                     _ => {}
                 }
             } else if p == 'z' {
@@ -1251,6 +1264,9 @@ impl App {
                 }
             }
             KeyCode::Char(' ') => self.page_or_next(),
+            // In the list, l opens a folded conversation into its messages and h folds it back.
+            KeyCode::Char('l') | KeyCode::Right if self.on_thread(&[RowKind::Collapsed]) => self.set_fold(Some(false)),
+            KeyCode::Char('h') | KeyCode::Left if self.on_thread(&[RowKind::Head, RowKind::Child]) => self.set_fold(Some(true)),
             KeyCode::Char('h') | KeyCode::Left => self.left(),
             KeyCode::Char('l') | KeyCode::Right => self.right(),
             KeyCode::Enter => self.right(),
@@ -1341,6 +1357,7 @@ impl App {
             KeyCode::Char('f') => self.respond(Kind::Forward),
 
             KeyCode::Char('o') => self.open_html(),
+            KeyCode::Char('L') => self.pick_link(),
             KeyCode::Char('b') => {
                 if self.targets().is_empty() {
                     return;
@@ -1772,6 +1789,23 @@ impl App {
         }
     }
 
+    fn link_completions(&self, input: &str) -> Vec<String> {
+        let Some(b) = &self.body else { return vec![] };
+        let q = input.trim().to_lowercase();
+        crate::parse::links(&b.text, b.html.as_deref()).into_iter().filter(|u| u.to_lowercase().contains(&q)).collect()
+    }
+
+    fn pick_link(&mut self) {
+        if self.body.is_none() {
+            return;
+        }
+        let completions = self.link_completions("");
+        if completions.is_empty() {
+            return self.say("no links in this message");
+        }
+        self.mode = Mode::Prompt(Prompt { kind: PromptKind::Link, input: String::new(), sel: Some(0), completions });
+    }
+
     fn save_attachments(&mut self) {
         let Some(b) = &self.body else { return };
         if b.attachments.is_empty() {
@@ -1914,10 +1948,11 @@ impl App {
             PromptKind::Attach => Self::path_completions(&input),
             PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter | PromptKind::QuickAdd | PromptKind::ConfirmDelete => vec![],
             PromptKind::Snooze => self.snooze_choices(&input),
+            PromptKind::Link => self.link_completions(&input),
         };
         if let Mode::Prompt(p) = &mut self.mode {
             p.sel = match kind {
-                PromptKind::Move => (!c.is_empty()).then_some(0),
+                PromptKind::Move | PromptKind::Link => (!c.is_empty()).then_some(0),
                 _ => None,
             };
             p.completions = c;
@@ -1994,6 +2029,11 @@ impl App {
             KeyCode::Char('u') if ctrl(&k) => {
                 p.input.clear();
                 self.after_prompt_edit(kind);
+            }
+            KeyCode::Char('y') if ctrl(&k) && kind == PromptKind::Link => {
+                let Some(url) = p.sel.and_then(|s| p.completions.get(s)).cloned() else { return };
+                self.mode = Mode::Normal;
+                self.copy_text(&url);
             }
             KeyCode::Backspace => {
                 p.input.pop();
@@ -2080,6 +2120,15 @@ impl App {
                     self.fail(format!("not a file: {}", path.display()));
                 }
                 self.mode = Mode::Compose(c);
+            }
+            PromptKind::Link => {
+                match picked {
+                    Some(url) => {
+                        self.say(format!("opening {url}"));
+                        self.actions.push(Action::Open(url));
+                    }
+                    None => self.say("no link matches"),
+                }
             }
         }
     }

@@ -80,6 +80,7 @@ tern falls back to a built-in Tokyo Night.
 | `gi gs gd ga gt gj gf` | inbox, sent, drafts, archive, trash, junk, flagged | `/` | live filter; `⏎` also searches the server |
 | `gu` | all inboxes, every account in one list | `b` | snooze until… |
 | `$` | check for mail now | `esc` | clear filter / marks / zoom |
+| `l` `h` | on a conversation: open it into its messages / fold it back | | |
 | `za` `zo` `zc` | toggle / open / fold a conversation | `zM` `zR` | fold / unfold all |
 | `T` | threads on / off | | |
 
@@ -88,7 +89,8 @@ tern falls back to a built-in Tokyo Night.
 | `m` | new message |
 | `r` `R` `f` | reply / reply all / forward (forward carries attachments) |
 | `H` | show the message as HTML / as text |
-| `o` | open the HTML version in the browser |
+| `o` | open the message in the browser (HTML, or the text if there's none) |
+| `L` `gx` | links in the message: type to filter, `⏎` opens, `^y` copies |
 | `S` | save attachments to `download_dir` |
 | `U` | follow List-Unsubscribe |
 | `A` | add the sender to CardDAV |
@@ -325,8 +327,9 @@ messages and the latest one are shown in full, the others shrink to one line,
 and quoted text is hidden because the earlier messages are already above it.
 
 Archive, delete, junk, move, read/unread and `x` act on the whole conversation.
-`s` flags only the latest message. `za` unfolds a thread into a tree so you can
-act on one message. Set `collapse_threads = false` to start with every thread
+`s` flags only the latest message. `l` opens a conversation into its messages
+so you can act on one: `j` `k` move through them and `h` on any of them folds it
+back (`za` does the same). Set `collapse_threads = false` to start with every thread
 unfolded, or `threads = false` for a flat list.
 
 Your own replies show up only if they are in the folder you're viewing. tern

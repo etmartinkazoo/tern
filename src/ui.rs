@@ -856,7 +856,8 @@ fn draw_conversation(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let avail = (r.height as usize).saturating_sub(head.len() + 1);
     app.body_height = avail + 2;
     app.body_lines = body.len();
-    if app.conv_jump && th.chrono.iter().all(|&i| app.cached(app.all[i].uid).is_some()) {
+    // Folded messages are one line whether loaded or not, so the jump only waits for the open ones.
+    if app.conv_jump && th.chrono.iter().all(|&i| !app.conv_open.contains(&app.all[i].uid) || app.cached(app.all[i].uid).is_some()) {
         app.body_scroll = anchor.unwrap_or(0);
         app.conv_jump = false;
     }
@@ -1107,6 +1108,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
             PromptKind::ConfirmDelete => ("DELETE?", t.red),
             PromptKind::Move => ("MOVE", t.magenta),
             PromptKind::Attach => ("ATTACH", t.yellow),
+            PromptKind::Link => ("LINK", t.cyan),
         },
         Mode::Settings(_) => ("SETTINGS", t.cyan),
         Mode::Outbox(_) => ("OUTBOX", t.yellow),
@@ -1136,6 +1138,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
             PromptKind::ConfirmDelete => "",
             PromptKind::Move => " move to:",
             PromptKind::Attach => " file:",
+            PromptKind::Link => " link:",
         };
         spans.push(Span::styled(label, Style::default().fg(t.muted)));
         spans.push(Span::styled(format!(" {}", p.input), Style::default().fg(t.fg)));
@@ -1148,6 +1151,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
             PromptKind::Snooze => "  3h · tomorrow 9am · mon · or pick ↑↓ · enter snoozes",
             PromptKind::ConfirmDelete => "  y deletes · anything else keeps it",
             PromptKind::Move | PromptKind::Attach => "  tab: complete · ↑↓ pick · enter: ok",
+            PromptKind::Link => "  type to filter · ↑↓ pick · enter: open in browser · ^y: copy",
         };
         spans.push(Span::styled(hint, Style::default().fg(t.subtle)));
         f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(t.surface)), r);
@@ -1219,11 +1223,14 @@ fn draw_completions(f: &mut Frame, app: &App, main: Rect, t: &Theme) {
     let w = p.completions.iter().map(|c| c.width()).max().unwrap_or(10).clamp(24, main.width as usize - 4) as u16 + 4;
     let area = Rect { x: main.x + 1, y: main.y + main.height - n, width: w.min(main.width - 2), height: n };
     f.render_widget(Clear, area);
+    // Keep the selection in view when there are more than fit.
+    let skip = p.sel.unwrap_or(0).saturating_sub(n.saturating_sub(1) as usize);
     let lines: Vec<Line> = p
         .completions
         .iter()
-        .take(8)
         .enumerate()
+        .skip(skip)
+        .take(8)
         .map(|(i, c)| {
             let sel = p.sel == Some(i);
             let st = if sel {

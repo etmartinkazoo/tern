@@ -11,7 +11,7 @@ pub const KEYMAP: &[Section] = &[
         title: "Move",
         keys: &[
             ("j k", "down / up (counts work: 5j)"),
-            ("h l", "focus pane left / right"),
+            ("h l", "focus pane left / right (on a conversation: fold / open it)"),
             ("⏎", "open folder, read message"),
             ("tab ⇧tab", "cycle panes"),
             ("J K", "next / previous message from any pane"),
@@ -54,6 +54,7 @@ pub const KEYMAP: &[Section] = &[
     Section {
         title: "Threads",
         keys: &[
+            ("l h", "open a conversation into its messages / fold it back"),
             ("za", "fold / unfold the conversation"),
             ("zo zc", "unfold / fold"),
             ("zM zR", "fold all / unfold all"),
@@ -68,7 +69,8 @@ pub const KEYMAP: &[Section] = &[
             ("f", "forward (keeps attachments)"),
             ("H", "show this message as HTML / as text"),
             ("a t n", "meeting invite: yes / maybe / no"),
-            ("o", "open the HTML version in the browser"),
+            ("o", "open the message in the browser"),
+            ("L gx", "links: enter opens one, ^y copies it"),
             ("S", "save attachments"),
             ("U", "unsubscribe (List-Unsubscribe)"),
             ("A", "add sender to contacts"),
