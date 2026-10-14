@@ -84,6 +84,8 @@ pub struct Body {
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
     pub list_unsubscribe: Option<String>,
+    /// A meeting invitation (text/calendar part), raw.
+    pub invite: Option<String>,
     /// The full RFC 822 message, kept for saving attachments and forwarding.
     pub raw: Vec<u8>,
 }

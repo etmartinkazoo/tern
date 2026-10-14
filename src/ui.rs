@@ -467,6 +467,34 @@ fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let focused = app.focus == Focus::Body;
     let w = r.width as usize;
     let icons = Icons { on: app.cfg.ui.icons };
+    // A meeting invitation gets a card, checked against the synced calendars.
+    let invite = app.body.as_ref().and_then(|b| b.invite.as_deref()).and_then(crate::calendar::invite);
+    if invite.is_some() && app.cal.occ.is_empty() && !app.cal.calendars.is_empty() {
+        app.cal.expand();
+    }
+    let conflicts: Vec<String> = invite
+        .as_ref()
+        .map(|inv| {
+            app.cal
+                .occ
+                .iter()
+                .filter(|o| o.uid != inv.uid && !o.all_day && !inv.all_day && o.start < inv.end && inv.start < o.end)
+                .map(|o| format!("{} {}–{}", o.summary, o.start.format("%H:%M"), o.end.format("%H:%M")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let me = app.current.as_ref().map(|c| app.accts[c.0].cfg.email.to_lowercase()).unwrap_or_default();
+    // Your answer lives in your calendar's copy once you've given one.
+    let answered = invite.as_ref().and_then(|inv| {
+        let needle = format!("UID:{}", inv.uid);
+        app.cal
+            .calendars
+            .iter()
+            .flat_map(|c| c.items.values())
+            .find(|ics| ics.contains(&needle))
+            .and_then(|ics| crate::calendar::invite(ics))
+            .and_then(|copy| copy.attendees.into_iter().find(|a| a.0 == me).map(|a| a.2))
+    });
     let Some(b) = &app.body else {
         let mut lines = vec![Line::from(pane_title("", focused, t))];
         let msg = if app.selected().is_some() { "loading…" } else { "" };
@@ -511,6 +539,9 @@ fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         ]));
     }
 
+    if let Some(inv) = &invite {
+        head.extend(invite_card(inv, &conflicts, &me, answered.as_deref(), w, t));
+    }
     let text_w = w.saturating_sub(2);
     // Plain text by default; `H` swaps in the HTML part rendered with its styling.
     let as_html = app.html_view.contains(&b.uid) && b.html.is_some();
@@ -555,6 +586,73 @@ fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let body_area = Rect { y: r.y + head_h, height: r.height.saturating_sub(head_h), x: r.x + 1, width: r.width.saturating_sub(1) };
     let lines: Vec<Line> = body_lines.into_iter().skip(app.body_scroll).take(avail).collect();
     f.render_widget(Paragraph::new(lines), body_area);
+}
+
+fn invite_card(inv: &crate::calendar::Invite, conflicts: &[String], me: &str, answered: Option<&str>, w: usize, t: &Theme) -> Vec<Line<'static>> {
+    let bar = |c| Span::styled(" ▌ ", Style::default().fg(c));
+    let (accent, title) = match inv.method.as_str() {
+        "CANCEL" => (t.red, "Cancelled"),
+        "REPLY" => (t.green, "Reply"),
+        _ => (t.accent, "Invitation"),
+    };
+    let mut out = vec![Line::from("")];
+    out.push(Line::from(vec![
+        bar(accent),
+        Span::styled(format!("{title} · "), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Span::styled(fit(&inv.summary, w.saturating_sub(18)), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
+    ]));
+    let when = if inv.all_day {
+        format!("{} · all day", inv.start.format("%a %e %b %Y"))
+    } else {
+        format!("{} · {}–{}", inv.start.format("%a %e %b %Y"), inv.start.format("%H:%M"), inv.end.format("%H:%M"))
+    };
+    let rec = if inv.recurring { "  ↻ repeats" } else { "" };
+    out.push(Line::from(vec![bar(accent), Span::styled(when, Style::default().fg(t.fg)), Span::styled(rec, Style::default().fg(t.subtle))]));
+    if !inv.location.is_empty() {
+        let mut l = styled_line(&fit(&inv.location, w.saturating_sub(6)), Kind::Text, t);
+        l.spans.insert(0, bar(accent));
+        out.push(l);
+    }
+    let count = |s: &str| inv.attendees.iter().filter(|a| a.2 == s).count();
+    let org = if inv.organizer_name.is_empty() { inv.organizer.clone() } else { inv.organizer_name.clone() };
+    out.push(Line::from(vec![
+        bar(accent),
+        Span::styled(format!("from {org} · {} guests", inv.attendees.len()), Style::default().fg(t.muted)),
+        Span::styled(
+            format!("  {} yes · {} maybe · {} no · {} waiting", count("ACCEPTED"), count("TENTATIVE"), count("DECLINED"), count("NEEDS-ACTION")),
+            Style::default().fg(t.subtle),
+        ),
+    ]));
+    if inv.method == "REQUEST" {
+        let mine = answered.or_else(|| inv.attendees.iter().find(|a| a.0 == me).map(|a| a.2.as_str())).unwrap_or("NEEDS-ACTION");
+        let (ans, c) = match mine {
+            "ACCEPTED" => ("you said yes", t.green),
+            "TENTATIVE" => ("you said maybe", t.yellow),
+            "DECLINED" => ("you said no", t.red),
+            _ => ("waiting for your answer", t.yellow),
+        };
+        let key = |k: &str, label: &str, col| {
+            vec![
+                Span::styled(format!(" {k} "), Style::default().fg(t.bg).bg(col).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {label}  "), Style::default().fg(t.muted)),
+            ]
+        };
+        let mut spans = vec![bar(accent), Span::styled(format!("{ans}   "), Style::default().fg(c))];
+        spans.extend(key("a", "yes", t.green));
+        spans.extend(key("t", "maybe", t.yellow));
+        spans.extend(key("n", "no", t.red));
+        out.push(Line::from(spans));
+    }
+    if !conflicts.is_empty() {
+        out.push(Line::from(vec![
+            bar(accent),
+            Span::styled("overlaps ", Style::default().fg(t.red).add_modifier(Modifier::BOLD)),
+            Span::styled(fit(&conflicts.join(" · "), w.saturating_sub(14)), Style::default().fg(t.red)),
+        ]));
+    } else if inv.method == "REQUEST" {
+        out.push(Line::from(vec![bar(accent), Span::styled("no conflicts", Style::default().fg(t.subtle))]));
+    }
+    out
 }
 
 /// HTML laid out for the terminal: headings and bold, italics, links, code, lists and

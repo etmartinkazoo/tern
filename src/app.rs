@@ -983,6 +983,9 @@ impl App {
 
             KeyCode::Char('o') => self.open_html(),
             KeyCode::Char('H') => self.toggle_html(),
+            KeyCode::Char('a') => self.answer_invite("ACCEPTED"),
+            KeyCode::Char('t') => self.answer_invite("TENTATIVE"),
+            KeyCode::Char('n') => self.answer_invite("DECLINED"),
             KeyCode::Char('S') => self.save_attachments(),
             KeyCode::Char('U') => self.unsubscribe(),
             KeyCode::Char('A') => self.add_contact(),
@@ -1198,6 +1201,107 @@ impl App {
             Kind::Forward => "Forward",
         };
         self.compose(title, d);
+    }
+
+    /// a / t / n on a meeting invitation: reply to the organizer, and put the event in
+    /// (or take it out of) your calendar.
+    fn answer_invite(&mut self, partstat: &'static str) {
+        let Some(b) = self.body.clone() else { return };
+        let Some(ics) = b.invite.clone() else {
+            return self.say("not a meeting invitation");
+        };
+        let Some(inv) = crate::calendar::invite(&ics) else {
+            return self.say_error("couldn't read the invitation");
+        };
+        if inv.method != "REQUEST" {
+            return self.say(format!("this is a {} — nothing to answer", inv.method.to_lowercase()));
+        }
+        let a = self.acct_idx();
+        let acct = self.accts[a].cfg.clone();
+        let me = acct.email.clone();
+        let my_name = acct.display_name.clone().unwrap_or_default();
+        let (word, verb) = match partstat {
+            "ACCEPTED" => ("Accepted", "accepted"),
+            "TENTATIVE" => ("Tentative", "tentatively accepted"),
+            _ => ("Declined", "declined"),
+        };
+        let when = inv.start.format("%a %e %b %Y, %H:%M").to_string();
+        let who = if my_name.is_empty() { me.clone() } else { my_name.clone() };
+        let text = format!("{who} has {verb} this invitation:\n\n{}\n{when}\n", inv.summary);
+        let reply = match crate::calendar::reply_ics(&ics, &me, &my_name, partstat) {
+            Ok(r) => r,
+            Err(e) => return self.say_error(format!("{e:#}")),
+        };
+        let organizer = if inv.organizer_name.is_empty() {
+            inv.organizer.clone()
+        } else {
+            format!("\"{}\" <{}>", inv.organizer_name.replace('"', ""), inv.organizer)
+        };
+        let msg = match crate::compose::invite_reply(&acct, &organizer, &format!("{word}: {}", inv.summary), &text, reply) {
+            Ok(m) => m,
+            Err(e) => return self.say_error(format!("{e:#}")),
+        };
+
+        // The calendar side: an existing copy (same UID) is updated, or removed on decline.
+        let existing = self.cal.calendars.iter().enumerate().find_map(|(ci, c)| {
+            c.items.iter().find(|(_, v)| v.contains(&format!("UID:{}", inv.uid))).map(|(id, _)| (ci, id.clone()))
+        });
+        let cal_job = match (partstat, existing) {
+            ("DECLINED", Some((ci, id))) => {
+                let c = &self.cal.calendars[ci];
+                Some((c.source.clone(), c.id.clone(), id.clone(), None, c.etags.get(&id).cloned()))
+            }
+            ("DECLINED", None) => None,
+            (_, found) => {
+                let copy = match crate::calendar::calendar_copy(&ics, &me, &my_name, partstat) {
+                    Ok(c) => c,
+                    Err(e) => return self.say_error(format!("{e:#}")),
+                };
+                let (ci, id) = match found {
+                    Some(x) => x,
+                    None => match self.cal.target() {
+                        Some(ci) => {
+                            let safe: String = inv.uid.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+                            (ci, format!("{safe}.ics"))
+                        }
+                        None => {
+                            self.say("no calendar to file it in — add a [[dav]] source");
+                            (usize::MAX, String::new())
+                        }
+                    },
+                };
+                (ci != usize::MAX).then(|| {
+                    let c = &self.cal.calendars[ci];
+                    (c.source.clone(), c.id.clone(), id.clone(), Some(copy), c.etags.get(&id).cloned())
+                })
+            }
+        };
+        if let Some(e) = self.selected().map(|e| e.uid) {
+            if let Some((_, f)) = self.current.clone() {
+                self.send(a, Cmd::SetFlag { folder: f, uids: vec![e], flag: "\\Answered", on: true });
+            }
+        }
+        if self.demo {
+            return self.say(format!("demo: would reply “{word}” to {} and update the calendar", inv.organizer));
+        }
+        self.say(format!("{word} · replying to {}…", inv.organizer));
+        let (cfg, tx) = (self.cfg.clone(), self.events_tx.clone());
+        tokio::spawn(async move {
+            if let Err(e) = crate::compose::send(&acct, msg).await {
+                let _ = tx.send(Event::Error(usize::MAX, format!("reply failed: {e:#}")));
+                return;
+            }
+            let r = match cal_job {
+                Some((src, cal, id, Some(ics), etag)) => {
+                    crate::dav::put_event(cfg, src, cal, id, ics, etag).await.map(|_| format!("{word} · replied and added to your calendar"))
+                }
+                Some((src, cal, id, None, etag)) => {
+                    crate::dav::delete_event(cfg, src, cal, id, etag).await.map(|_| format!("{word} · replied and removed from your calendar"))
+                }
+                None => Ok(format!("{word} · replied")),
+            };
+            let _ = tx.send(Event::CalWrite(r.map_err(|e| format!("replied, but the calendar wasn't updated: {e:#}"))));
+        });
     }
 
     fn toggle_html(&mut self) {

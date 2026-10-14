@@ -544,3 +544,199 @@ ATTENDEE;CN=Jo:mailto:jo@x.y\r\nX-CUSTOM:keep me\r\nSEQUENCE:3\r\nBEGIN:VALARM\r
         assert_eq!(draft_of(&out).unwrap().start, d.start);
     }
 }
+
+// ------------------------------------------------------------------- invitations (iTIP)
+
+use ical::prop::{attendee::ATTENDEE, method::METHOD};
+
+#[derive(Debug, Clone)]
+pub struct Invite {
+    /// REQUEST, CANCEL, REPLY, …
+    pub method: String,
+    pub uid: String,
+    pub summary: String,
+    pub location: String,
+    pub start: DateTime<Local>,
+    pub end: DateTime<Local>,
+    pub all_day: bool,
+    pub organizer: String,
+    pub organizer_name: String,
+    /// (address, name, PARTSTAT)
+    pub attendees: Vec<(String, String, String)>,
+    pub recurring: bool,
+}
+
+/// Unfolded content lines.
+fn unfold(ics: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in ics.replace("\r\n", "\n").split('\n') {
+        if (raw.starts_with(' ') || raw.starts_with('\t')) && !out.is_empty() {
+            out.last_mut().unwrap().push_str(&raw[1..]);
+        } else if !raw.is_empty() {
+            out.push(raw.to_string());
+        }
+    }
+    out
+}
+
+/// Split `NAME;P=V;P2="a:b":value` at the colon outside quotes.
+fn split_line(l: &str) -> (String, Vec<(String, String)>, String) {
+    let mut quoted = false;
+    let mut cut = l.len();
+    for (i, c) in l.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ':' if !quoted => {
+                cut = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let (head, value) = (&l[..cut], l.get(cut + 1..).unwrap_or(""));
+    let mut parts = head.split(';');
+    let name = parts.next().unwrap_or("").to_uppercase();
+    let params = parts
+        .filter_map(|p| p.split_once('='))
+        .map(|(k, v)| (k.to_uppercase(), v.trim_matches('"').to_string()))
+        .collect();
+    (name, params, value.to_string())
+}
+
+fn mailto(v: &str) -> String {
+    v.trim().trim_start_matches("mailto:").trim_start_matches("MAILTO:").to_lowercase()
+}
+
+pub fn invite(ics: &str) -> Option<Invite> {
+    let lines = unfold(ics);
+    let method = lines
+        .iter()
+        .map(|l| split_line(l))
+        .find(|(n, _, _)| n == "METHOD")
+        .map(|(_, _, v)| v.to_uppercase())
+        .unwrap_or_else(|| "REQUEST".into());
+    let far = Local::now();
+    let occ = expand(ics, "", 0, far - Duration::days(3650), far + Duration::days(3650));
+    let first = occ.iter().find(|o| o.start >= far - Duration::days(1)).or(occ.first())?.clone();
+    let mut inv = Invite {
+        method,
+        uid: first.uid.clone(),
+        summary: first.summary.clone(),
+        location: first.location.clone(),
+        start: first.start,
+        end: first.end,
+        all_day: first.all_day,
+        organizer: String::new(),
+        organizer_name: String::new(),
+        attendees: vec![],
+        recurring: first.recurring,
+    };
+    let mut in_event = false;
+    for l in &lines {
+        let (name, params, value) = split_line(l);
+        let param = |k: &str| params.iter().find(|(p, _)| p == k).map(|(_, v)| v.clone()).unwrap_or_default();
+        match name.as_str() {
+            "BEGIN" if value.eq_ignore_ascii_case("VEVENT") => in_event = true,
+            "END" if value.eq_ignore_ascii_case("VEVENT") => in_event = false,
+            "ORGANIZER" if in_event && inv.organizer.is_empty() => {
+                inv.organizer = mailto(&value);
+                inv.organizer_name = param("CN");
+            }
+            "ATTENDEE" if in_event => {
+                let st = param("PARTSTAT");
+                inv.attendees.push((mailto(&value), param("CN"), if st.is_empty() { "NEEDS-ACTION".into() } else { st.to_uppercase() }));
+            }
+            _ => {}
+        }
+    }
+    // Overrides repeat the attendee list; keep each person once.
+    let mut seen = std::collections::HashSet::new();
+    inv.attendees.retain(|a| seen.insert(a.0.clone()));
+    Some(inv)
+}
+
+/// My ATTENDEE line with the given PARTSTAT, keeping the CN the organizer used.
+fn my_attendee(ics: &str, me: &str, my_name: &str, partstat: &str) -> String {
+    let cn = unfold(ics)
+        .iter()
+        .map(|l| split_line(l))
+        .find(|(n, _, v)| n == "ATTENDEE" && mailto(v) == me.to_lowercase())
+        .and_then(|(_, p, _)| p.into_iter().find(|(k, _)| k == "CN").map(|(_, v)| v))
+        .unwrap_or_else(|| my_name.to_string());
+    let cn = if cn.is_empty() { String::new() } else { format!(";CN=\"{}\"", cn.replace('"', "")) };
+    format!("ATTENDEE;PARTSTAT={partstat}{cn}:mailto:{me}")
+}
+
+/// The iTIP REPLY to send the organizer (RFC 5546 3.2.3): the event with only my
+/// ATTENDEE, carrying my answer.
+pub fn reply_ics(ics: &str, me: &str, my_name: &str, partstat: &str) -> anyhow::Result<String> {
+    let mut cst = IcalCst::parse(ics).map_err(|e| anyhow::anyhow!("reading the invitation: {e}"))?;
+    cst.remove::<METHOD>();
+    cst.push_raw("METHOD:REPLY").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let me_line = my_attendee(ics, me, my_name, partstat);
+    let ev = cst.component_mut::<VEVENT>().ok_or_else(|| anyhow::anyhow!("no event in the invitation"))?;
+    ev.remove::<ATTENDEE>().remove::<DTSTAMP>();
+    ev.push_raw(&format!("DTSTAMP:{}", stamp())).map_err(|e| anyhow::anyhow!("{e}"))?;
+    ev.push_raw(&me_line).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(cst.to_string())
+}
+
+/// The event as it goes into my calendar: no METHOD, my PARTSTAT updated, everyone
+/// else as invited.
+pub fn calendar_copy(ics: &str, me: &str, my_name: &str, partstat: &str) -> anyhow::Result<String> {
+    let mut cst = IcalCst::parse(ics).map_err(|e| anyhow::anyhow!("reading the invitation: {e}"))?;
+    cst.remove::<METHOD>();
+    let others: Vec<String> = unfold(ics)
+        .into_iter()
+        .filter(|l| split_line(l).0 == "ATTENDEE" && mailto(&split_line(l).2) != me.to_lowercase())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let me_line = my_attendee(ics, me, my_name, partstat);
+    let ev = cst.component_mut::<VEVENT>().ok_or_else(|| anyhow::anyhow!("no event in the invitation"))?;
+    ev.remove::<ATTENDEE>();
+    for l in others.into_iter().filter(|l| seen.insert(l.clone())) {
+        ev.push_raw(&l).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    ev.push_raw(&me_line).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(cst.to_string())
+}
+
+#[cfg(test)]
+mod invite_tests {
+    use super::*;
+
+    const REQ: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Google//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:inv-1@google\r\n\
+DTSTAMP:20260101T000000Z\r\nDTSTART;TZID=Europe/Berlin:20261020T100000\r\nDTEND;TZID=Europe/Berlin:20261020T110000\r\nSUMMARY:Roadmap sync\r\n\
+ORGANIZER;CN=Maya Okafor:mailto:maya@northwind.io\r\nATTENDEE;CN=Maya Okafor;PARTSTAT=ACCEPTED:mailto:maya@northwind.io\r\n\
+ATTENDEE;CN=Ted;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:Ted@Example.com\r\nATTENDEE;CN=\"Berg, Jonas\";PARTSTAT=TENTATIVE:mailto:jonas@berg.dev\r\n\
+SEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    #[test]
+    fn reads_request() {
+        let i = invite(REQ).unwrap();
+        assert_eq!(i.method, "REQUEST");
+        assert_eq!(i.organizer, "maya@northwind.io");
+        assert_eq!(i.organizer_name, "Maya Okafor");
+        assert_eq!(i.attendees.len(), 3);
+        assert_eq!(i.attendees[2], ("jonas@berg.dev".into(), "Berg, Jonas".into(), "TENTATIVE".into()));
+        assert_eq!((i.end - i.start).num_minutes(), 60);
+    }
+
+    #[test]
+    fn reply_has_only_me() {
+        let r = reply_ics(REQ, "ted@example.com", "Ted Martin", "ACCEPTED").unwrap();
+        assert!(r.contains("METHOD:REPLY") && !r.contains("METHOD:REQUEST"));
+        assert!(r.contains("ATTENDEE;PARTSTAT=ACCEPTED;CN=\"Ted\":mailto:ted@example.com"), "{r}");
+        assert_eq!(r.matches("ATTENDEE").count(), 1);
+        assert!(r.contains("UID:inv-1@google") && r.contains("DTSTART;TZID=Europe/Berlin:20261020T100000"));
+    }
+
+    #[test]
+    fn calendar_copy_keeps_others() {
+        let c = calendar_copy(REQ, "ted@example.com", "Ted Martin", "TENTATIVE").unwrap();
+        assert!(!c.contains("METHOD:"));
+        assert_eq!(c.matches("ATTENDEE").count(), 3);
+        assert!(c.contains("PARTSTAT=TENTATIVE;CN=\"Ted\":mailto:ted@example.com"));
+        assert!(c.contains("CN=\"Berg, Jonas\""));
+    }
+}

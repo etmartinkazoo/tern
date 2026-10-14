@@ -96,6 +96,7 @@ fn demo_body(v: &[Envelope], uid: u32) -> Option<Body> {
         html: None,
         attachments,
         list_unsubscribe: None,
+        invite: None,
         raw: vec![],
     })
 }

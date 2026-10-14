@@ -102,6 +102,7 @@ pub fn body(uid: u32, raw: Vec<u8>) -> Body {
             html: None,
             attachments: vec![],
             list_unsubscribe: None,
+            invite: None,
             raw,
         };
     };
@@ -124,8 +125,23 @@ pub fn body(uid: u32, raw: Vec<u8>) -> Body {
         String::new()
     };
 
+    // Meeting invitations travel as a text/calendar part (sometimes an .ics attachment).
+    let invite = msg
+        .parts
+        .iter()
+        .find(|p| {
+            let ct = p.content_type();
+            let cal = ct.is_some_and(|c| c.ctype().eq_ignore_ascii_case("text") && c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("calendar")))
+                || ct.is_some_and(|c| c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("ics")))
+                || p.attachment_name().is_some_and(|n| n.to_lowercase().ends_with(".ics"));
+            cal && String::from_utf8_lossy(p.contents()).contains("BEGIN:VEVENT")
+        })
+        .map(|p| String::from_utf8_lossy(p.contents()).into_owned());
+
     let attachments = msg
         .attachments()
+        // The invitation is shown as a card, not as a file.
+        .filter(|p| !p.content_type().is_some_and(|c| c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("calendar"))))
         .map(|p| Attachment {
             name: p.attachment_name().unwrap_or("unnamed").to_string(),
             size: p.contents().len(),
@@ -165,6 +181,7 @@ pub fn body(uid: u32, raw: Vec<u8>) -> Body {
         html,
         attachments,
         list_unsubscribe,
+        invite,
         raw: Vec::new(),
     };
     drop(msg);

@@ -230,6 +230,21 @@ impl Draft {
     }
 }
 
+/// The answer to a meeting invitation: a short note for people, and the iTIP REPLY
+/// that calendar software reads (RFC 6047).
+pub fn invite_reply(me: &Account, to: &str, subject: &str, text: &str, ics: String) -> Result<Message> {
+    let from: Mailbox = me.sender_mailbox().parse().context("parsing your From address")?;
+    let to: Mailbox = to.parse().map_err(|e| anyhow!("organizer `{to}`: {e}"))?;
+    let cal = SinglePart::builder()
+        .header(ContentType::parse("text/calendar; method=REPLY; charset=UTF-8").map_err(|e| anyhow!("{e}"))?)
+        .body(ics);
+    Ok(Message::builder()
+        .from(from)
+        .to(to)
+        .subject(subject)
+        .multipart(MultiPart::alternative().singlepart(SinglePart::plain(text.to_string())).singlepart(cal))?)
+}
+
 fn mime_for(name: &str) -> ContentType {
     let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
     let t = match ext.as_str() {
