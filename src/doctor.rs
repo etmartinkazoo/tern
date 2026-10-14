@@ -294,7 +294,7 @@ fn local(o: &mut Out, cfg: &Config) {
     match dir {
         Some(d) if d.exists() => {
             let t = crate::theme::Theme::load(Some(&d));
-            if t.name == "fallback" {
+            if t.name.ends_with("(built in)") {
                 o.warn("theme", &format!("{} has no colors tern can read", d.display()), Some("it reads colors.toml, alacritty.toml, kitty.conf or ghostty.conf"));
             } else {
                 o.ok("theme", &format!("{} ({})", t.name, d.display()));

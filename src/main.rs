@@ -205,8 +205,13 @@ async fn run(cfg: config::Config, demo: bool, cfg_path: PathBuf) -> Result<()> {
         app.contacts = vec![
             contacts::Contact { name: "Maya Okafor".into(), emails: vec!["maya@northwind.io".into()], org: "Northwind".into(), phones: vec!["+1 415 555 0134".into()], note: "Runs product at Northwind.".into(), ..Default::default() },
             contacts::Contact { name: "Jonas Berg".into(), emails: vec!["jonas@berg.dev".into()], ..Default::default() },
-            contacts::Contact { name: "Lena Fischer".into(), emails: vec!["lena@kleinwerk.de".into()], org: "Kleinwerk".into(), ..Default::default() },
+            contacts::Contact { name: "Lena Fischer".into(), emails: vec!["lena@kleinwerk.de".into()], org: "Kleinwerk".into(), phones: vec!["+49 30 5557 2210".into()], note: "Met at the Berlin meetup, 2023. Flat whites, mornings.".into(), ..Default::default() },
+            contacts::Contact { name: "Priya Raman".into(), emails: vec!["priya@finch.co".into(), "priya.raman@gmail.com".into()], org: "Finch".into(), phones: vec!["+1 212 555 0198".into()], note: "Counsel on the Northwind contract.".into(), ..Default::default() },
+            contacts::Contact { name: "Sam Whitaker".into(), emails: vec!["sam@whitaker.studio".into()], org: "Whitaker Studio".into(), ..Default::default() },
+            contacts::Contact { name: "Ana Souza".into(), emails: vec!["ana@kleinwerk.de".into()], org: "Kleinwerk".into(), ..Default::default() },
+            contacts::Contact { name: "Dad".into(), emails: vec!["martin.r@icloud.com".into()], phones: vec!["+1 802 555 0117".into()], ..Default::default() },
         ];
+        app.contacts.sort_by_key(|c| c.name.to_lowercase());
     }
     app.start();
 

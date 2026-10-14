@@ -6,88 +6,118 @@ use chrono::{Duration, Local};
 use std::collections::HashMap;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-const PEOPLE: &[(&str, &str)] = &[
+const PEOPLE_ADDR: &[(&str, &str)] = &[
     ("Maya Okafor", "maya@northwind.io"),
-    ("GitHub", "notifications@github.com"),
-    ("Linear", "updates@linear.app"),
-    ("Jonas Berg", "jonas@berg.dev"),
     ("Priya Raman", "priya@finch.co"),
-    ("Stripe", "receipts@stripe.com"),
-    ("Hacker Newsletter", "kale@hackernewsletter.com"),
     ("Sam Whitaker", "sam@whitaker.studio"),
-    ("Fastmail", "support@fastmail.com"),
     ("Lena Fischer", "lena@kleinwerk.de"),
 ];
 
-const SUBJECTS: &[&str] = &[
-    "Re: Q4 roadmap — final cut before Friday",
-    "[omarchy] feat: theme hot-reload for terminal apps (#1204)",
-    "ENG-482 Sync engine drops flags on reconnect",
-    "Coffee next week?",
-    "Contract draft v3 attached",
-    "Your receipt from Northwind #2291-0042",
-    "Hacker Newsletter #712",
-    "Re: Re: Logo directions",
-    "Scheduled maintenance: Oct 18, 02:00 UTC",
-    "Fwd: Berlin offsite logistics",
-    "Invoice overdue — gentle nudge",
-    "Design review notes",
+/// Who writes what: (name, address, subject, body). The body's `{me}` is the reader.
+const CATALOG: &[(&str, &str, &str, &str)] = &[
+    ("Maya Okafor", "maya@northwind.io", "Q4 roadmap — final cut before Friday",
+     "Hey,\n\nPulled the numbers together — short version: we can ship the sync rewrite and the new compose flow, but not both alongside the billing migration. I'd cut billing to January.\n\nThree things I need from you before Friday:\n\n  1. Sign-off on dropping the calendar beta\n  2. Whether Lena's team can absorb the CardDAV work\n  3. A yes/no on the offsite\n\nFull doc: https://docs.northwind.io/roadmap/q4-final\n\nThanks,\nMaya\n\n-- \nMaya Okafor · Head of Product\nNorthwind · https://northwind.io"),
+    ("GitHub", "notifications@github.com", "[omarchy] feat: theme hot-reload for terminal apps (#1204)",
+     "@tedmartin requested your review on this pull request.\n\nThis adds an inotify watch on ~/.config/omarchy/current/theme so terminal apps can re-read colors without a restart.\n\nCommit summary:\n  * watch the theme symlink, not its target\n  * debounce to 200ms\n  * docs: document the reload hook\n\nFile changes: 6 files, +214 −38\n\n— Reply to this email directly or view it on GitHub:\nhttps://github.com/basecamp/omarchy/pull/1204"),
+    ("Linear", "updates@linear.app", "ENG-482 Sync engine drops flags on reconnect",
+     "Jonas Berg moved ENG-482 to In Progress.\n\nWhen the IMAP connection drops mid-STORE, the \\Flagged change is applied locally but never retried. After reconnect the server state wins and the flag disappears.\n\nPriority: High · Cycle 14 · Estimate: 3\n\nhttps://linear.app/northwind/issue/ENG-482"),
+    ("Lena Fischer", "lena@kleinwerk.de", "Coffee next week?",
+     "Hi!\n\nAre you around next Tuesday or Wednesday? I'm in town for the conference and would love to catch up properly — it's been way too long.\n\nThere's a place near the river that does a great flat white. Morning works best for me.\n\nLena"),
+    ("Priya Raman", "priya@finch.co", "Contract draft v3 attached",
+     "Hi Ted,\n\nPlease find the revised contract attached. Changes from v2:\n\n- Payment terms moved to net-30\n- Clause 7.2 (IP assignment) narrowed to deliverables only\n- Added the termination-for-convenience clause you asked for\n\nIf this looks right I'll send it for signature on Thursday.\n\nBest,\nPriya"),
+    ("Stripe", "receipts@stripe.com", "Your receipt from Northwind #2291-0042",
+     "Receipt from Northwind\n\nAmount paid      $1,240.00\nDate paid        Oct 13, 2026\nPayment method   Visa ending in 4242\n\nTeam plan — 10 seats         $1,200.00\nAdditional storage (50 GB)      $40.00\n\nQuestions? Contact billing@northwind.io"),
+    ("Hacker Newsletter", "kale@hackernewsletter.com", "Hacker Newsletter #712",
+     "Hacker Newsletter #712\n\n#Favorites\n\n  The terminal is the IDE (again)\n  Why we moved our mail stack back to IMAP\n  A tour of CalDAV in 2026\n\n#Code\n\n  Writing a TUI that doesn't flicker\n  Rust async without the tears\n\nUnsubscribe: https://hackernewsletter.com/unsubscribe"),
+    ("Sam Whitaker", "sam@whitaker.studio", "Logo directions",
+     "Hey Ted,\n\nThree directions for the mark, attached as one PDF:\n\n  A — the bird, geometric, one weight\n  B — wordmark only, tight tracking\n  C — monogram for the app icon\n\nMy vote is A for the site and C for the dock. Happy to jump on a call.\n\nSam"),
+    ("Fastmail", "support@fastmail.com", "Scheduled maintenance: Oct 18, 02:00 UTC",
+     "We'll be performing scheduled maintenance on Saturday, October 18 from 02:00 to 03:00 UTC.\n\nIMAP, SMTP and CalDAV may be briefly unavailable. Mail sent during the window is queued and delivered afterwards — nothing is lost.\n\nThe Fastmail team"),
+    ("Jonas Berg", "jonas@berg.dev", "Fwd: Berlin offsite logistics",
+     "FYI — forwarding the hotel details. Flights are on you, everything else is booked.\n\n---------- Forwarded message ----------\nFrom: Kleinwerk Events <events@kleinwerk.de>\nSubject: Berlin offsite logistics\n\nCheck-in: Nov 4 · Hotel Oderberger, Oderberger Str. 57\nDinner: Nov 4, 19:30 · Prater Garten\nWorkshop: Nov 5–6, 09:30 · Kleinwerk studio"),
+    ("Finch Accounts", "accounts@finch.co", "Invoice overdue — gentle nudge",
+     "Hi Ted,\n\nA friendly reminder that invoice FIN-0342 ($4,800.00) was due on October 1.\n\nIf it's already on its way, please ignore this. Otherwise you can pay here: https://pay.finch.co/FIN-0342\n\nThanks,\nFinch Accounts"),
+    ("Sam Whitaker", "sam@whitaker.studio", "Design review notes",
+     "Notes from today:\n\n- Sidebar density: keep it, it's the point\n- Unread dot reads well in every theme we tried\n- Compose pane: move the field hints to the status line\n- Next review: Thursday 14:00\n\nSam"),
+    ("Dad", "martin.r@icloud.com", "Photos from the weekend",
+     "Here are the ones from the lake. Your mother says the one of the dog is going on the fridge.\n\nCall Sunday?\n\nDad"),
+    ("Kestrel Travel", "trips@kestrel.travel", "Booking confirmed: Berlin, Nov 4–7",
+     "Your trip is confirmed.\n\nOutbound   Tue Nov 4   07:55 → 10:05\nReturn     Fri Nov 7   18:40 → 20:50\nHotel      Hotel Oderberger, 3 nights\n\nBooking reference: KT-88Q2LM"),
+    ("Northwind Status", "status@northwind.io", "Weekly uptime report — 99.98%",
+     "API          99.99%\nSync         99.97%\nWeb app     100.00%\n\nOne incident: 14 minutes of delayed sync on Tuesday (ENG-482).\n\nhttps://status.northwind.io"),
+    ("Ana Souza", "ana@kleinwerk.de", "Intro: Ana ↔ Ted",
+     "Hi Ted,\n\nLena suggested I reach out — we're moving our team's calendars to CalDAV and I'd love twenty minutes of your time to hear how you set it up.\n\nAny afternoon next week works.\n\nAna"),
 ];
 
-fn body_for(e: &Envelope) -> String {
-    let s = &e.subject;
-    let kind = if s.contains("[omarchy]") || s.starts_with("ENG-") {
-        1
-    } else if s.contains("Coffee") || s.contains("Logo") || s.contains("Berlin") {
-        2
-    } else if s.contains("Contract") || s.contains("Invoice") || s.contains("receipt") {
-        3
-    } else {
-        0
-    };
-    match kind {
-        0 => format!(
-            "Hey,\n\nPulled the numbers together — short version: we can ship the sync rewrite and the new compose flow, but not both alongside the billing migration. I'd cut billing to January.\n\nThree things I need from you before Friday:\n\n  1. Sign-off on dropping the calendar beta\n  2. Whether Lena's team can absorb the CardDAV work\n  3. A yes/no on the offsite\n\nFull doc: https://docs.northwind.io/roadmap/q4-final\n\nOn Mon, Oct 13, 2026 at 9:14 AM, you wrote:\n> Can we get a one-pager on what actually fits? I don't need the\n> spreadsheet, just the call.\n>\n> On Sun, Oct 12, Jonas Berg wrote:\n>> Flagging that sync is still the riskiest piece. Two weeks of\n>> buffer minimum.\n\nThanks,\n{}\n\n-- \n{}\nNorthwind · https://northwind.io",
-            e.from_name, e.from_name
-        ),
-        1 => "@tedmartin requested your review on this pull request.\n\nThis adds an inotify watch on ~/.config/omarchy/current/theme so terminal apps can re-read colors without a restart.\n\nCommit summary\n  * watch the theme symlink, not the directory\n  * debounce 150ms so omarchy-theme-set's burst of writes is one reload\n  * fall back to polling on filesystems without inotify\n\nFile changes\n  M bin/omarchy-theme-set (12)\n  A lib/theme-watch.sh (48)\n\n— \nReply to this email directly, view it on GitHub:\nhttps://github.com/basecamp/omarchy/pull/1204".into(),
-        2 => "Hi!\n\nAre you around next Tuesday or Wednesday? I'm in town for the conference and would love to catch up properly — it's been way too long.\n\nThere's a place near the river that does a ridiculous cortado. Morning works best for me, anything before 11.\n\nL.".into(),
-        _ => "Please find the revised contract attached. Changes from v2:\n\n- Payment terms moved to net-30\n- Clause 7.2 (IP assignment) narrowed to deliverables only\n- Added the termination-for-convenience language you asked for\n\nIf this looks right, sign where flagged and send it back. If not, mark it up and we'll do one more pass.\n\nBest,\nPriya".into(),
-    }
+/// The inbox, newest first: (catalog entry, minutes ago, replying as, seen, flagged, text).
+/// `replying as` None is the original; Some(name) answers the previous message in the
+/// same conversation ("" is you).
+const INBOX: &[(usize, i64, Option<&str>, bool, bool, &str)] = &[
+    (0, 18, Some("Maya Okafor"), false, false, "Agree with Priya — billing waits until January. I'll update the plan tonight and send the one-pager in the morning."),
+    (1, 33, None, false, false, ""),
+    (4, 95, Some("Priya Raman"), false, true, "Signed copy attached. Thanks for turning this around so fast."),
+    (2, 140, None, true, true, ""),
+    (0, 190, Some("Priya Raman"), true, false, "Sent the revised numbers. Short version: it fits if we drop the beta."),
+    (8, 260, None, true, false, ""),
+    (7, 410, Some("Sam Whitaker"), true, false, "Great — going with A. I'll send final files Friday."),
+    (5, 520, None, true, false, ""),
+    (3, 52, Some("Lena Fischer"), false, false, "Perfect, Wednesday 9:30 it is. See you there!"),
+    (6, 980, None, true, false, ""),
+    (3, 1250, Some(""), true, false, "Yes! Wednesday morning works. Send me the place?"),
+    (3, 1300, None, true, false, ""),
+    (0, 1500, Some(""), true, false, "Can we get a one-pager on what actually fits? I don't need the spreadsheet, just the call."),
+    (9, 2200, None, true, false, ""),
+    (0, 2900, None, true, false, ""),
+    (10, 3500, None, true, true, ""),
+    (4, 4000, Some(""), true, false, "Looks good. One question on 7.2 — does \"deliverables\" include the design files?"),
+    (4, 4300, None, true, false, ""),
+    (7, 5800, Some(""), true, false, "Leaning A. Can you try it at 16px?"),
+    (7, 6000, None, true, false, ""),
+    (11, 7200, None, true, false, ""),
+    (12, 8400, None, true, true, ""),
+    (13, 9900, None, true, false, ""),
+    (14, 11500, None, true, false, ""),
+    (15, 13000, None, true, false, ""),
+];
+
+fn find(subject: &str) -> Option<&'static (&'static str, &'static str, &'static str, &'static str)> {
+    let base = subject.trim_start_matches("Re: ");
+    CATALOG.iter().find(|c| c.2 == base)
 }
 
-const REPLIES: &[&str] = &[
-    "Works for me. Let's lock it in and revisit after the sync milestone.",
-    "Agree with Maya — billing can wait. I'll update the plan tonight.",
-    "Can we get 15 minutes tomorrow to settle this? Morning is best.",
-    "Sent the revised numbers. Short version: it fits if we drop the beta.",
-    "+1. Also flagging that Lena's team is out the week of the 20th.",
-];
-
-fn demo_body(v: &[Envelope], uid: u32) -> Option<Body> {
+fn demo_body(v: &[Envelope], texts: &HashMap<u32, String>, uid: u32) -> Option<Body> {
     let (i, e) = v.iter().enumerate().find(|(_, e)| e.uid == uid)?;
-    let attachments = if e.has_attachment || i % 4 == 3 {
-        vec![Attachment { name: "contract-v3.pdf".into(), size: 248_000 }]
+    let attachments = if e.has_attachment {
+        let name = match find(&e.subject).map(|c| c.2) {
+            Some(s) if s.starts_with("Logo") => "logo-directions.pdf",
+            Some(s) if s.starts_with("Fwd: Berlin") => "offsite-itinerary.pdf",
+            Some(s) if s.starts_with("Photos") => "lake-2026.zip",
+            _ => "contract-v3.pdf",
+        };
+        vec![Attachment { name: name.into(), size: 248_000 }]
     } else {
         vec![]
     };
-    let text = match v.iter().find(|p| p.message_id == e.in_reply_to) {
-        Some(p) => format!(
-            "{}\n\n{}\n\nOn {}, {} wrote:\n{}",
-            REPLIES[uid as usize % REPLIES.len()],
-            e.from_name.split(' ').next().unwrap_or(""),
-            p.date.map(|d| d.format("%a %b %e").to_string()).unwrap_or_default(),
-            p.from_name,
-            body_for(p).lines().take(6).map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
-        ),
-        None => body_for(e),
+    let own = texts.get(&uid).cloned().unwrap_or_else(|| find(&e.subject).map(|c| c.3.to_string()).unwrap_or_default());
+    let text = match v.iter().find(|p| !e.in_reply_to.is_empty() && p.message_id == e.in_reply_to) {
+        Some(p) => {
+            let prev = texts.get(&p.uid).cloned().unwrap_or_else(|| find(&p.subject).map(|c| c.3.to_string()).unwrap_or_default());
+            format!(
+                "{own}\n\n{}\n\nOn {}, {} wrote:\n{}",
+                e.from_name.split(' ').next().unwrap_or(""),
+                p.date.map(|d| d.format("%a %b %e").to_string()).unwrap_or_default(),
+                p.from_name,
+                prev.lines().take(6).map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+            )
+        }
+        None => own,
     };
     Some(Body {
         uid,
         from: format!("{} <{}>", e.from_name, e.from_addr),
         reply_to: String::new(),
         to: e.to.clone(),
-        cc: if i % 3 == 0 { "Jonas Berg <jonas@berg.dev>, Lena Fischer <lena@kleinwerk.de>".into() } else { String::new() },
+        cc: if i % 5 == 0 && e.from_addr.ends_with("northwind.io") { "Jonas Berg <jonas@berg.dev>, Priya Raman <priya@finch.co>".into() } else { String::new() },
         subject: e.subject.clone(),
         date: e.date.map(|d| d.format("%a %e %b %Y %H:%M").to_string()).unwrap_or_default(),
         message_id: format!("<{}>", e.message_id),
@@ -107,6 +137,7 @@ pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Eve
         let mut boxes: HashMap<String, Vec<Envelope>> = HashMap::new();
         let names = ["INBOX", "Archive", "Sent", "Drafts", "Trash", "Junk", "Clients", "Clients/Northwind", "Receipts"];
         let mut uid = 1000;
+        let mut texts: HashMap<u32, String> = HashMap::new();
         for (bi, name) in names.iter().enumerate() {
             let n = match bi {
                 0 => 48,
@@ -115,41 +146,61 @@ pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Eve
                 _ => 6 + bi * 2,
             };
             let mut v = Vec::new();
-            for i in 0..n {
-                uid += 1;
-                let (pn, pe) = PEOPLE[(i * 7 + bi) % PEOPLE.len()];
-                v.push(Envelope {
-                    uid,
-                    from_name: pn.into(),
-                    from_addr: pe.into(),
-                    to: "Ted Martin <ted@example.com>".into(),
-                    subject: SUBJECTS[(i * 5 + bi) % SUBJECTS.len()].into(),
-                    date: Some(now - Duration::minutes((i as i64).pow(2) * 23 + 7)),
-                    seen: bi != 0 || i > 6,
-                    flagged: i % 9 == 2,
-                    answered: i % 5 == 3,
-                    has_attachment: i % 6 == 4,
-                    message_id: format!("{uid}@demo"),
-                    acct: 0,
-                    in_reply_to: String::new(),
-                    references: vec![],
-                });
-            }
             if bi == 0 {
-                // Conversations: message i answers i+12, which answers i+24 (same subject,
-                // older), and you wrote some of the replies.
-                for i in 0..24 {
-                    let parent = v[i + 12].message_id.clone();
-                    let base = v[i + 12].subject.trim_start_matches("Re: ").to_string();
-                    let e = &mut v[i];
-                    e.in_reply_to = parent.clone();
-                    e.references = vec![parent];
-                    e.subject = format!("Re: {base}");
-                    if i % 4 == 1 {
-                        e.from_name = "Ted Martin".into();
-                        e.from_addr = "ted@example.com".into();
-                        e.seen = true;
+                let mut last: HashMap<usize, String> = HashMap::new();
+                // Oldest first, so each reply can point at the message before it.
+                for &(c, ago, reply, seen, flagged, text) in INBOX.iter().rev() {
+                    uid += 1;
+                    let (cn, ca, subject, _) = CATALOG[c];
+                    let (from_name, from_addr) = match reply {
+                        Some("") => ("Ted Martin", "ted@example.com"),
+                        Some(n) => (n, PEOPLE_ADDR.iter().find(|p| p.0 == n).map(|p| p.1).unwrap_or(ca)),
+                        None => (cn, ca),
+                    };
+                    let parent = if reply.is_some() { last.get(&c).cloned().unwrap_or_default() } else { String::new() };
+                    let message_id = format!("{uid}@demo");
+                    last.insert(c, message_id.clone());
+                    if !text.is_empty() {
+                        texts.insert(uid, text.to_string());
                     }
+                    v.push(Envelope {
+                        uid,
+                        from_name: from_name.into(),
+                        from_addr: from_addr.into(),
+                        to: "Ted Martin <ted@example.com>".into(),
+                        subject: if reply.is_some() { format!("Re: {subject}") } else { subject.into() },
+                        date: Some(now - Duration::minutes(ago)),
+                        seen,
+                        flagged,
+                        answered: reply.is_none() && INBOX.iter().any(|x| x.0 == c && x.2 == Some("")),
+                        has_attachment: reply.is_none() && [4, 7, 9, 12].contains(&c),
+                        message_id,
+                        acct: 0,
+                        in_reply_to: parent.clone(),
+                        references: if parent.is_empty() { vec![] } else { vec![parent] },
+                    });
+                }
+                v.sort_by(|a, b| b.date.cmp(&a.date));
+            } else {
+                for i in 0..n {
+                    uid += 1;
+                    let (pn, pe, subject, _) = CATALOG[(i * 7 + bi) % CATALOG.len()];
+                    v.push(Envelope {
+                        uid,
+                        from_name: if bi == 2 { "Ted Martin".into() } else { pn.into() },
+                        from_addr: if bi == 2 { "ted@example.com".into() } else { pe.into() },
+                        to: if bi == 2 { format!("{pn} <{pe}>") } else { "Ted Martin <ted@example.com>".into() },
+                        subject: subject.into(),
+                        date: Some(now - Duration::minutes((i as i64).pow(2) * 23 + 600 * bi as i64)),
+                        seen: true,
+                        flagged: i % 9 == 2,
+                        answered: i % 5 == 3,
+                        has_attachment: false,
+                        message_id: format!("{uid}@demo"),
+                        acct: 0,
+                        in_reply_to: String::new(),
+                        references: vec![],
+                    });
                 }
             }
             boxes.insert(name.to_string(), v);
@@ -190,13 +241,13 @@ pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Eve
                     let _ = tx.send(Event::Envelopes { acct: idx, folder, items, total });
                 }
                 Cmd::Body { folder, uid } => {
-                    if let Some(body) = boxes.get(&folder).and_then(|v| demo_body(v, uid)) {
+                    if let Some(body) = boxes.get(&folder).and_then(|v| demo_body(v, &texts, uid)) {
                         let _ = tx.send(Event::Body { acct: idx, folder, body: Box::new(body) });
                     }
                 }
                 Cmd::Bodies { folder, uids } => {
                     for uid in uids {
-                        if let Some(body) = boxes.get(&folder).and_then(|v| demo_body(v, uid)) {
+                        if let Some(body) = boxes.get(&folder).and_then(|v| demo_body(v, &texts, uid)) {
                             let _ = tx.send(Event::Body { acct: idx, folder: folder.clone(), body: Box::new(body) });
                         }
                     }

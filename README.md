@@ -158,7 +158,7 @@ swaps the signature to match.
 week, or type `3h`, `2d`, `tomorrow 9am`, `fri 2pm`. The message moves to a
 `Snoozed` folder on its server (created the first time), so it's out of your
 inbox on your phone too. When the time comes, and tern is running, it's moved
-back to the inbox, marked unread, with a notification. Snoozes are remembered
+back to the folder it came from, marked unread, with a notification. Snoozes are remembered
 in `~/.local/share/tern/snoozed.json` and caught up on the next start.
 
 ## People
@@ -288,7 +288,7 @@ on a dark theme. `o` still opens the real thing in your browser.
 
 ## Settings and mouse
 
-`,` opens settings, and `?` opens it at the Keys tab. The four tabs:
+`,` opens settings, and `?` opens it at the Keys tab. The five tabs (`1`–`5` jump between them):
 
 - **General:** threads, folding, undo-send window, mark-read delay, time zone,
   today in the sidebar, notifications and reminder time, Zoom link and Meet
@@ -296,8 +296,9 @@ on a dark theme. `o` still opens the real thing in your browser.
   folder and editor. Changes apply
   immediately and are saved to `config.toml`; your comments and layout there
   are kept.
-- **Accounts:** servers, connection state, folders and contacts (read-only;
-  credentials stay in the file).
+- **Accounts:** add, edit and remove accounts (see [Accounts](#accounts)).
+- **Calendars:** calendar and contacts servers, which calendars show, and the
+  default for new events.
 - **Keys:** every shortcut. `/` filters the list.
 - **Theme:** the active Omarchy theme, its palette and a preview.
 
@@ -343,7 +344,8 @@ doesn't merge in your Sent folder yet.
 - Sent mail is saved to the Sent folder (`save_sent = false` for Gmail).
   Replies set `\Answered` on the original. A send that fails stays in the
   outbox and is retried.
-- Contacts are cached in `~/.cache/tern/contacts.json` and refreshed hourly.
+- Contacts are cached in `~/.cache/tern/contacts.json` and refreshed at startup
+  when they're over an hour old, after you change a contact, or with `gc`.
   `tern query <text>` prints mutt-style query output, so an editor plugin can
   complete addresses too.
 - Passwords come from `password_cmd` (`pass`, `secret-tool`, `op read`, …) or
