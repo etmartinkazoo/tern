@@ -107,7 +107,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     app.hits = Hits::default();
 
-    if matches!(app.mode, Mode::Settings(_)) {
+    let account_form = matches!(&app.mode, Mode::Compose(c) if c.account.is_some());
+    if matches!(app.mode, Mode::Settings(_)) || account_form {
         draw_settings(f, app, main, &t);
     } else if app.screen == View::Calendar {
         draw_calendar(f, app, main, &t);
@@ -177,11 +178,20 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         let a = &app.accts[row.acct];
         let cursor = focused && i == app.side_cursor;
         let Some(fi) = row.folder else {
+            let folded = app.collapsed.contains(&a.cfg.name);
+            let arrow = if folded { "▸" } else { "▾" };
             let dot = if a.connected { "" } else { " ○" };
-            lines.push(Line::from(Span::styled(
-                pad(&format!(" {}{dot}", a.cfg.name.to_uppercase()), w),
-                Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
-            )));
+            let unread: u32 = if folded { a.folders.iter().filter(|f| f.role == Role::Inbox).map(|f| f.unread).sum() } else { 0 };
+            let count = if unread > 0 { unread.to_string() } else { String::new() };
+            let label = format!(" {arrow} {}{dot}", a.cfg.name.to_uppercase());
+            let mut line = Line::from(vec![
+                Span::styled(pad(&label, w.saturating_sub(count.width() + 1)), Style::default().fg(t.muted).add_modifier(Modifier::BOLD)),
+                Span::styled(rpad(&count, count.width() + 1), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            ]);
+            if cursor {
+                line = line.style(Style::default().bg(t.sel_bg));
+            }
+            lines.push(line);
             continue;
         };
         let fo = &a.folders[fi];
@@ -887,7 +897,7 @@ fn draw_soft_wrapped(f: &mut Frame, c: &mut Composer, area: Rect, cur_st: Style,
 
 fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: Rect, t: &Theme) {
     let w = r.width as usize;
-    let label_w = 9u16;
+    let label_w = (c.labels.iter().map(|l| l.width()).max().unwrap_or(7) + 3).max(9) as u16;
     let (mode_txt, mode_c) = match c.mode {
         VMode::Insert => ("INSERT", t.green),
         VMode::Normal => ("NORMAL", t.accent),
@@ -905,9 +915,15 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
     let row = |y: u16| Rect { x: r.x, y, width: r.width, height: 1 };
     f.render_widget(Paragraph::new(Line::from(head)), row(y));
     y += 1;
-    if c.event.is_none() {
+    if c.event.is_none() && c.account.is_none() {
         f.render_widget(Paragraph::new(header_line("From", from, w, t)), row(y));
         y += 1;
+    }
+    if !c.note.is_empty() {
+        for l in textwrap::wrap(&c.note, w.saturating_sub(3).max(10)).into_iter().take(3) {
+            f.render_widget(Paragraph::new(Span::styled(format!(" {l}"), Style::default().fg(t.subtle))), row(y));
+            y += 1;
+        }
     }
 
     let field_style = Style::default().fg(t.fg);
@@ -923,13 +939,13 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
     let mut focus_row = y;
     for i in 0..c.fields.len() {
         // Bcc stays out of the way until it has something or you go to it.
-        if c.event.is_none() && i == composer::BCC && c.focus != i && c.fields[i].is_empty() {
+        if c.event.is_none() && c.account.is_none() && i == composer::BCC && c.focus != i && c.fields[i].is_empty() {
             continue;
         }
         let focused = c.focus == i;
         let label_c = if focused && active { t.accent } else { t.subtle };
         f.render_widget(
-            Paragraph::new(Span::styled(format!(" {:<8}", c.labels[i]), Style::default().fg(label_c))),
+            Paragraph::new(Span::styled(format!(" {:<w$}", c.labels[i], w = label_w as usize - 1), Style::default().fg(label_c))),
             Rect { width: label_w, ..row(y) },
         );
         let ta = &mut c.fields[i];
@@ -938,7 +954,14 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
         ta.set_selection_style(Style::default().bg(t.sel_bg));
         ta.set_placeholder_text(c.placeholders.get(i).copied().unwrap_or(""));
         ta.set_placeholder_style(Style::default().fg(t.subtle));
-        f.render_widget(&*ta, Rect { x: r.x + label_w, y, width: r.width.saturating_sub(label_w + 1), height: 1 });
+        let field_area = Rect { x: r.x + label_w, y, width: r.width.saturating_sub(label_w + 1), height: 1 };
+        // An empty field we're not in shows its hint, aligned with filled ones.
+        if ta.is_empty() && !(active && focused) {
+            let hint = c.placeholders.get(i).copied().unwrap_or("");
+            f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(t.subtle))), field_area);
+        } else {
+            f.render_widget(&*ta, field_area);
+        }
         if focused {
             focus_row = y;
         }
@@ -979,7 +1002,9 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
         vec![Span::styled(k.to_string(), Style::default().fg(t.yellow)), Span::styled(format!(" {label}  "), Style::default().fg(t.subtle))]
     };
     let mut hint = vec![Span::raw(" ")];
-    let keys: &[(&str, &str)] = if c.event.is_some() {
+    let keys: &[(&str, &str)] = if c.account.is_some() {
+        &[("^s ZZ", "save"), (":q!", "cancel"), ("tab", "next field"), ("body", "= signature")]
+    } else if c.event.is_some() {
         &[("^s ZZ", "save"), (":q!", "discard"), ("tab", "next field")]
     } else {
         &[("^s", "send"), ("^t", "attach"), (":w", "draft"), (":q!", "discard"), (":e", "$EDITOR")]
@@ -1414,7 +1439,11 @@ fn draw_event(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
 }
 
 fn draw_settings(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
-    let Mode::Settings(st) = &app.mode else { return };
+    let st = match (&app.mode, &app.parked_settings) {
+        (Mode::Settings(st), _) => st,
+        (Mode::Compose(_), Some(st)) => st,
+        _ => return,
+    };
     let (tab, cursor, editing, filter, typing) = (st.tab, st.cursor, st.editing.clone(), st.filter.clone(), st.typing);
     let side_w = app.cfg.ui.sidebar_width.min(r.width / 4).max(14);
     let [side, sep, body] =
@@ -1453,6 +1482,12 @@ fn draw_settings(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
 
     let inner = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
     app.hits.settings_body = inner;
+    // An account form opens over the tab's content.
+    if let Mode::Compose(c) = &mut app.mode {
+        if c.account.is_some() {
+            return draw_composer(f, c, true, "", inner, t);
+        }
+    }
     match tab {
         settings::GENERAL => draw_settings_general(f, app, inner, t, cursor, editing),
         settings::ACCOUNTS => draw_settings_accounts(f, app, inner, t),
@@ -1540,40 +1575,108 @@ fn draw_settings_accounts(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         crate::config::Tls::Starttls => "STARTTLS",
         crate::config::Tls::None => "no encryption",
     };
+    let (cursor, picking, confirm) = match &app.mode {
+        Mode::Settings(st) => (st.acct_cursor, st.picking, st.confirm),
+        _ => (0, None, None),
+    };
+    let w = r.width as usize;
     let mut lines = vec![Line::from("")];
-    for a in &app.accts {
-        let c = &a.cfg;
-        let (dot, dc, state) = if a.connected { ("●", t.green, "connected") } else { ("○", t.subtle, "not connected") };
-        lines.push(Line::from(vec![
-            Span::styled(c.name.to_uppercase(), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {dot} {state}"), Style::default().fg(dc)),
-        ]));
-        lines.push(kv("Address", c.sender_mailbox(), t));
-        lines.push(kv("IMAP", format!("{}:{} · {} · {}", c.imap.host, c.imap.port, tls(c.imap.tls), c.imap.username), t));
-        lines.push(kv("SMTP", format!("{}:{} · {} · {}", c.smtp.host, c.smtp.port, tls(c.smtp.tls), c.smtp.username), t));
-        let unread: u32 = a.folders.iter().map(|f| f.unread).sum();
-        lines.push(kv("Folders", format!("{} · {unread} unread", a.folders.len()), t));
-        lines.push(kv("Check every", format!("{}s · newest {} per folder", c.imap.poll_secs, c.imap.page_size), t));
-        lines.push(kv("Sent copies", if c.save_sent { "saved to Sent".into() } else { "left to the server".into() }, t));
-        if let Some(sig) = &c.signature {
-            lines.push(kv("Signature", sig.lines().next().unwrap_or("").to_string(), t));
+
+    // The provider chooser for a new account.
+    if let Some(p) = picking {
+        lines.push(section_line("New account · choose a provider", t));
+        lines.push(Line::from(""));
+        for (i, pr) in crate::accounts::PRESETS.iter().enumerate() {
+            let sel = i == p;
+            let extra = match (pr.caldav.is_empty(), pr.oauth.is_empty()) {
+                (false, true) => "mail · calendar · contacts",
+                (false, false) => "mail · calendar · contacts · OAuth",
+                (true, false) => "mail · OAuth",
+                (true, true) => "mail",
+            };
+            let mut l = Line::from(vec![
+                Span::styled(format!("  {}", pad(pr.label, 28)), Style::default().fg(if sel { t.fg } else { t.muted }).add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(extra, Style::default().fg(t.subtle)),
+            ]);
+            if sel {
+                l = l.style(Style::default().bg(t.sel_bg));
+            }
+            lines.push(l);
         }
         lines.push(Line::from(""));
+        for l in textwrap::wrap(crate::accounts::PRESETS[p].note, w.saturating_sub(4).max(10)) {
+            lines.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(t.subtle))));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  ⏎ continue · esc cancel", Style::default().fg(t.yellow))));
+        return scroll_render(f, app, r, lines);
     }
-    lines.push(section_line("Contacts", t));
-    let sources = app.cfg.dav_sources();
-    if sources.is_empty() {
-        lines.push(kv("DAV", "not set up — add a [[dav]] source to config.toml".into(), t));
+
+    lines.push(section_line("Accounts", t));
+    let n = app.cfg.accounts.len();
+    for (i, a) in app.cfg.accounts.iter().enumerate() {
+        let sel = i == cursor;
+        let live = app.accts.iter().find(|s| s.cfg.name == a.name);
+        let (dot, dc) = match live {
+            Some(s) if s.connected => ("●", t.green),
+            Some(_) => ("○", t.subtle),
+            None => ("◌", t.yellow),
+        };
+        let kind = if let Some(o) = &a.oauth { format!("{} · OAuth", o.provider) } else { "password".into() };
+        let mut l = Line::from(vec![
+            Span::styled(format!("  {dot} "), Style::default().fg(dc)),
+            Span::styled(pad(&a.name, 16), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
+            Span::styled(pad(&a.email, 34), Style::default().fg(t.muted)),
+            Span::styled(kind, Style::default().fg(t.subtle)),
+        ]);
+        if sel {
+            l = l.style(Style::default().bg(t.sel_bg));
+        }
+        lines.push(l);
     }
-    for d in sources {
-        lines.push(kv(&d.name, format!("{} · {}", d.url, d.username), t));
+    let mut add = Line::from(Span::styled("  + add an account", Style::default().fg(t.accent)));
+    if cursor >= n {
+        add = add.style(Style::default().bg(t.sel_bg));
     }
-    lines.push(kv("Cached", format!("{} contacts · gc syncs", app.contacts.len()), t));
+    lines.push(add);
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Servers and passwords live in config.toml; they aren't editable here.",
-        Style::default().fg(t.subtle),
-    )));
+
+    if let Some(i) = confirm {
+        lines.push(Line::from(Span::styled(
+            format!("  Remove {} and its calendar and contacts from config.toml?  y yes · anything else no", app.cfg.accounts[i].name),
+            Style::default().fg(t.red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    // Details of the selected account.
+    if let Some(a) = app.cfg.accounts.get(cursor) {
+        lines.push(kv("IMAP", format!("{}:{} · {} · {}", a.imap.host, a.imap.port, tls(a.imap.tls), a.imap.username), t));
+        lines.push(kv("SMTP", format!("{}:{} · {} · {}", a.smtp.host, a.smtp.port, tls(a.smtp.tls), a.smtp.username), t));
+        if let Some(s) = app.accts.iter().find(|s| s.cfg.name == a.name) {
+            let unread: u32 = s.folders.iter().map(|f| f.unread).sum();
+            lines.push(kv("Folders", format!("{} · {unread} unread", s.folders.len()), t));
+        }
+        lines.push(kv("Sent copies", if a.save_sent { "saved to Sent".into() } else { "left to the server".into() }, t));
+        let owned: Vec<_> = app.cfg.dav_sources().into_iter().filter(|d| d.account.as_deref() == Some(a.name.as_str())).collect();
+        for d in &owned {
+            lines.push(kv(d.name.trim_start_matches(&a.name).trim(), d.url.clone(), t));
+        }
+        if owned.is_empty() {
+            lines.push(kv("Calendar", "none — edit to add a CalDAV URL".into(), t));
+        }
+    }
+    let other: Vec<_> = app.cfg.dav_sources().into_iter().filter(|d| d.account.is_none()).collect();
+    if !other.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_line("Other calendar & contacts sources", t));
+        for d in other {
+            lines.push(kv(&d.name, format!("{} · {}", d.url, d.username), t));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(format!("  {} contacts cached", app.contacts.len()), Style::default().fg(t.subtle))));
+    lines.push(Line::from(Span::styled("  a add · ⏎ edit · d remove", Style::default().fg(t.yellow))));
     scroll_render(f, app, r, lines);
 }
 

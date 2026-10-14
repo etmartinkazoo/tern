@@ -52,6 +52,12 @@ pub struct Settings {
     pub filter: String,
     pub typing: bool,
     pub pending_g: bool,
+    /// Accounts tab: the selected row (one past the last account is "add").
+    pub acct_cursor: usize,
+    /// Choosing a provider for a new account: the highlighted preset.
+    pub picking: Option<usize>,
+    /// Asking before removing this account.
+    pub confirm: Option<usize>,
 }
 
 pub fn get(ui: &Ui, key: &str) -> String {

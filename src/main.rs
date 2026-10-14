@@ -1,3 +1,4 @@
+mod accounts;
 mod app;
 mod auth;
 mod calendar;

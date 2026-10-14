@@ -6,6 +6,7 @@ use crate::config::{Account, Config};
 use crate::contacts::{self, Contact};
 use crate::model::{Body, Cmd, Envelope, Event, Folder, Role};
 use crate::theme::{Theme, Watcher};
+use crate::accounts;
 use crate::settings::{self, GeneralRow, Settings};
 use crate::thread::{self, Row, RowKind, Thread};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -148,6 +149,10 @@ pub struct App {
     pub conv_jump: bool,
     pub screen: crate::calview::View,
     pub cal: crate::calview::CalState,
+    /// The settings view, set aside while an account form is open over it.
+    pub parked_settings: Option<Box<Settings>>,
+    /// Accounts folded shut in the sidebar, by name; remembered between runs.
+    pub collapsed: HashSet<String>,
     /// Where settings are saved; None in demo mode.
     pub cfg_path: Option<PathBuf>,
     pub hits: Hits,
@@ -210,6 +215,8 @@ impl App {
             server_hits: HashSet::new(),
             demo: false,
             cfg_path: None,
+            parked_settings: None,
+            collapsed: load_ui_state(),
             screen: crate::calview::View::Mail,
             cal: crate::calview::CalState::new(),
             hits: Hits::default(),
@@ -360,6 +367,9 @@ impl App {
         for (ai, a) in self.accts.iter().enumerate() {
             if multi {
                 rows.push(SideRow { acct: ai, folder: None });
+                if self.collapsed.contains(&a.cfg.name) {
+                    continue;
+                }
             }
             for fi in 0..a.folders.len() {
                 rows.push(SideRow { acct: ai, folder: Some(fi) });
@@ -840,6 +850,11 @@ impl App {
             } else if p == 'z' {
                 match k.code {
                     KeyCode::Char('z') => self.zoom = !self.zoom,
+                    KeyCode::Char('a') if self.focus == Focus::Sidebar => {
+                        if let Some(a) = self.side_rows().get(self.side_cursor).map(|r| r.acct) {
+                            self.toggle_account(a);
+                        }
+                    }
                     KeyCode::Char('a') => self.set_fold(None),
                     KeyCode::Char('o') => self.set_fold(Some(false)),
                     KeyCode::Char('c') => self.set_fold(Some(true)),
@@ -891,6 +906,13 @@ impl App {
             KeyCode::Home => self.top(),
             KeyCode::Char('J') => self.move_cursor(n as isize),
             KeyCode::Char('K') => self.move_cursor(-(n as isize)),
+            KeyCode::Char(' ') if self.focus == Focus::Sidebar => {
+                if let Some(a) = self.side_rows().get(self.side_cursor).map(|r| r.acct) {
+                    if self.accts.len() > 1 {
+                        self.toggle_account(a);
+                    }
+                }
+            }
             KeyCode::Char(' ') => self.page_or_next(),
             KeyCode::Char('h') | KeyCode::Left => self.left(),
             KeyCode::Char('l') | KeyCode::Right => self.right(),
@@ -1054,7 +1076,29 @@ impl App {
         }
     }
 
+    /// Fold or unfold an account's folders in the sidebar (the accordion). The cursor
+    /// lands on the account's heading so it stays put on screen.
+    fn toggle_account(&mut self, acct: usize) {
+        let name = self.accts[acct].cfg.name.clone();
+        if !self.collapsed.remove(&name) {
+            self.collapsed.insert(name);
+        }
+        if let Some(i) = self.side_rows().iter().position(|r| r.acct == acct && r.folder.is_none()) {
+            self.side_cursor = i;
+        }
+        save_ui_state(&self.collapsed);
+    }
+
     fn left(&mut self) {
+        // h on a folder folds its account, like closing a directory in a file tree.
+        if self.focus == Focus::Sidebar && self.accts.len() > 1 {
+            if let Some(r) = self.side_rows().get(self.side_cursor) {
+                if r.folder.is_some() {
+                    let a = r.acct;
+                    return self.toggle_account(a);
+                }
+            }
+        }
         self.focus = match self.focus {
             Focus::Body if self.zoom => {
                 self.zoom = false;
@@ -1070,6 +1114,10 @@ impl App {
             Focus::Sidebar => {
                 let rows = self.side_rows();
                 if let Some(r) = rows.get(self.side_cursor) {
+                    if r.folder.is_none() {
+                        let a = r.acct;
+                        return self.toggle_account(a);
+                    }
                     if let Some(fi) = r.folder {
                         let f = &self.accts[r.acct].folders[fi];
                         if f.selectable {
@@ -1739,6 +1787,169 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------- accounts
+
+    /// Keys on the Accounts tab. Returns false for ones the general settings keys handle.
+    fn accounts_key(&mut self, k: KeyEvent) -> bool {
+        let n = self.cfg.accounts.len();
+        let Mode::Settings(st) = &mut self.mode else { return false };
+        if let Some(i) = st.confirm.take() {
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.delete_account(i);
+            } else {
+                self.say("kept");
+            }
+            return true;
+        }
+        if let Some(p) = st.picking {
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => st.picking = Some((p + 1).min(accounts::PRESETS.len() - 1)),
+                KeyCode::Char('k') | KeyCode::Up => st.picking = Some(p.saturating_sub(1)),
+                KeyCode::Enter | KeyCode::Char('l') => {
+                    st.picking = None;
+                    self.open_account_form(None, p);
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => st.picking = None,
+                _ => {}
+            }
+            return true;
+        }
+        match k.code {
+            KeyCode::Char('j') | KeyCode::Down => st.acct_cursor = (st.acct_cursor + 1).min(n),
+            KeyCode::Char('k') | KeyCode::Up => st.acct_cursor = st.acct_cursor.saturating_sub(1),
+            KeyCode::Char('a') => st.picking = Some(0),
+            KeyCode::Enter | KeyCode::Char('e') => {
+                if st.acct_cursor >= n {
+                    st.picking = Some(0);
+                } else {
+                    let i = st.acct_cursor;
+                    self.open_account_form(Some(i), 0);
+                }
+            }
+            KeyCode::Char('d') if st.acct_cursor < n => st.confirm = Some(st.acct_cursor),
+            _ => return false,
+        }
+        true
+    }
+
+    fn open_account_form(&mut self, index: Option<usize>, preset: usize) {
+        if self.cfg_path.is_none() {
+            return self.say("demo: accounts can't be changed");
+        }
+        let (spec, title, note) = match index {
+            Some(i) => {
+                let s = accounts::Spec::from_config(&self.cfg, i);
+                let title = format!("Edit {}", s.name);
+                (s, title, "Changes reconnect the account as soon as you save.".to_string())
+            }
+            None => {
+                let p = &accounts::PRESETS[preset];
+                (accounts::Spec::from_preset(p), format!("New {} account", p.label), p.note.to_string())
+            }
+        };
+        let form = crate::composer::AccountForm {
+            index,
+            old_name: index.map(|i| self.cfg.accounts[i].name.clone()),
+            oauth: spec.oauth.clone(),
+            save_sent: spec.save_sent,
+        };
+        if let Mode::Settings(st) = std::mem::replace(&mut self.mode, Mode::Normal) {
+            self.parked_settings = Some(st);
+        }
+        self.mode = Mode::Compose(Box::new(Composer::new_account(&title, &spec, form, &note)));
+    }
+
+    fn restore_settings(&mut self) {
+        self.mode = match self.parked_settings.take() {
+            Some(st) => Mode::Settings(st),
+            None => Mode::Normal,
+        };
+    }
+
+    fn save_account(&mut self, c: Box<Composer>) {
+        let Some(form) = c.account.clone() else { return };
+        let spec = accounts::Spec::from_fields(&c.values(), c.body_text(), form.oauth.clone(), form.save_sent);
+        let fail = |app: &mut App, c: Box<Composer>, e: String| {
+            app.say_error(e);
+            app.mode = Mode::Compose(c);
+        };
+        if let Err(e) = spec.validate(&self.cfg, form.index) {
+            return fail(self, c, format!("{e:#}"));
+        }
+        let Some(path) = self.cfg_path.clone() else { return };
+        let result = std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| accounts::write(&text, form.index, form.old_name.as_deref(), &spec))
+            .and_then(|text| accounts::save(&path, &text).map(|_| ()))
+            .and_then(|_| crate::config::load(&path));
+        let cfg = match result {
+            Ok(c) => c,
+            Err(e) => return fail(self, c, format!("{e:#}")),
+        };
+        // Keep the UI settings in effect; take the new accounts and sources.
+        let ui = self.cfg.ui.clone();
+        self.cfg = Config { ui, ..cfg };
+        let i = form.index.unwrap_or(self.cfg.accounts.len() - 1);
+        self.connect_account(i);
+        self.restore_settings();
+        if let Mode::Settings(st) = &mut self.mode {
+            st.acct_cursor = i;
+        }
+        let mut msg = format!("saved {}", spec.name);
+        if !spec.caldav.is_empty() || !spec.carddav.is_empty() {
+            msg.push_str(" · calendar and contacts added");
+            self.sync_contacts();
+            self.cal.syncing = false;
+            self.sync_calendars();
+        }
+        if !spec.oauth.is_empty() {
+            msg.push_str(&format!(" · now run `tern auth {}` to sign in", spec.name));
+        }
+        self.say(msg);
+    }
+
+    /// Start (or restart) account `i`'s connection from the current config.
+    fn connect_account(&mut self, i: usize) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let acct = self.cfg.accounts[i].clone();
+        if !self.demo {
+            crate::imap::spawn(i, acct.clone(), rx, self.events_tx.clone());
+        }
+        if i < self.accts.len() {
+            // The old worker ends when its channel is dropped here.
+            self.accts[i].cfg = acct;
+            self.accts[i].tx = tx;
+            self.accts[i].connected = false;
+        } else {
+            self.accts.push(AcctState { cfg: acct, folders: vec![], tx, connected: false });
+        }
+        self.send(i, Cmd::Folders);
+        match self.current.clone() {
+            Some((a, f)) if a == i => self.send(i, Cmd::Select { folder: f }),
+            None => self.open_folder(i, "INBOX".into()),
+            _ => {}
+        }
+    }
+
+    fn delete_account(&mut self, i: usize) {
+        let Some(path) = self.cfg_path.clone() else { return };
+        let name = self.cfg.accounts[i].name.clone();
+        let r = std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|t| accounts::remove(&t, i, &name))
+            .and_then(|t| accounts::save(&path, &t));
+        match r {
+            Ok(()) => {
+                if let Ok(cfg) = crate::config::load(&path) {
+                    let ui = self.cfg.ui.clone();
+                    self.cfg = Config { ui, ..cfg };
+                }
+                self.say(format!("removed {name} from config.toml · restart tern to close its connection"));
+            }
+            Err(e) => self.say_error(format!("{e:#}")),
+        }
+    }
+
     // ---------------------------------------------------------------- settings
 
     pub fn open_settings(&mut self, tab: usize) {
@@ -1746,6 +1957,9 @@ impl App {
     }
 
     fn settings_key(&mut self, k: KeyEvent) {
+        if matches!(&self.mode, Mode::Settings(st) if st.tab == settings::ACCOUNTS && st.editing.is_none()) && self.accounts_key(k) {
+            return;
+        }
         let Mode::Settings(st) = &mut self.mode else { return };
         let rows = settings::general_rows();
         if let Some(buf) = st.editing.as_mut() {
@@ -1953,12 +2167,20 @@ impl App {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
                 self.save_event(c);
             }
-            Outcome::Attach | Outcome::External if matches!(&self.mode, Mode::Compose(c) if c.event.is_some()) => {
+            Outcome::Send | Outcome::SaveDraft if matches!(&self.mode, Mode::Compose(c) if c.account.is_some()) => {
+                let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
+                self.save_account(c);
+            }
+            Outcome::Attach | Outcome::External if matches!(&self.mode, Mode::Compose(c) if c.event.is_some() || c.account.is_some()) => {
                 self.say("not available for events");
             }
             Outcome::Send => {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
                 self.send_draft(c);
+            }
+            Outcome::Discard if matches!(&self.mode, Mode::Compose(c) if c.account.is_some()) => {
+                self.restore_settings();
+                self.say("not saved");
             }
             Outcome::Discard => {
                 self.mode = Mode::Normal;
@@ -2044,6 +2266,24 @@ impl App {
             }
         });
     }
+}
+
+fn ui_state_file() -> PathBuf {
+    crate::config::cache_dir().join("state.json")
+}
+
+fn load_ui_state() -> HashSet<String> {
+    std::fs::read(ui_state_file())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("collapsed").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+fn save_ui_state(collapsed: &HashSet<String>) {
+    let _ = std::fs::create_dir_all(crate::config::cache_dir());
+    let _ = std::fs::write(ui_state_file(), serde_json::json!({ "collapsed": collapsed }).to_string());
 }
 
 fn html_escape(s: &str) -> String {

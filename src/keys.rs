@@ -32,6 +32,8 @@ pub const KEYMAP: &[Section] = &[
             ("gj gf", "junk / flagged"),
             ("/", "filter as you type; ⏎ also searches the server"),
             ("$ ^r", "check for mail now"),
+            ("⏎ space za", "sidebar: fold / unfold an account"),
+            ("h", "sidebar: fold the account you're in"),
         ],
     },
     Section {
@@ -137,6 +139,7 @@ pub const KEYMAP: &[Section] = &[
             ("+ -", "adjust numbers"),
             ("/", "filter keys"),
             ("esc q", "close"),
+            ("a ⏎ d", "Accounts tab: add / edit / remove"),
         ],
     },
 ];

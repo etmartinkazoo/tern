@@ -12,6 +12,15 @@ pub const CC: usize = 1;
 pub const BCC: usize = 2;
 pub const SUBJECT: usize = 3;
 
+/// What an account form is editing (index None = a new account).
+#[derive(Clone, Debug)]
+pub struct AccountForm {
+    pub index: Option<usize>,
+    pub old_name: Option<String>,
+    pub oauth: String,
+    pub save_sent: bool,
+}
+
 /// What an event form is editing: which calendar, and which resource (None = new).
 #[derive(Clone, Debug)]
 pub struct EventForm {
@@ -47,6 +56,10 @@ pub struct Composer {
     addr_fields: usize,
     /// Set when this form edits a calendar event instead of a message.
     pub event: Option<EventForm>,
+    /// Set when this form edits an account.
+    pub account: Option<AccountForm>,
+    /// A line of guidance under the title.
+    pub note: String,
     pub body: TextArea<'static>,
     pub focus: usize,
     pub mode: VMode,
@@ -88,6 +101,8 @@ impl Composer {
             fields,
             addr_fields: 3,
             event: None,
+            account: None,
+            note: String::new(),
             body,
             focus,
             mode: VMode::Insert,
@@ -129,6 +144,8 @@ impl Composer {
             fields,
             addr_fields: 0,
             event: Some(form),
+            account: None,
+            note: String::new(),
             body,
             focus: 0,
             mode: if d.title.is_empty() { VMode::Insert } else { VMode::Normal },
@@ -144,6 +161,48 @@ impl Composer {
         }
         c.original = c.snapshot();
         c
+    }
+
+    /// The account form: servers, sign-in, calendar and contacts; the body is the
+    /// signature.
+    pub fn new_account(title: &str, spec: &crate::accounts::Spec, form: AccountForm, note: &str) -> Self {
+        let fields: Vec<TextArea<'static>> = spec.fields().iter().map(|v| area(v)).collect();
+        let mut body = area(&spec.signature);
+        body.move_cursor(CursorMove::Top);
+        let mut c = Composer {
+            title: title.to_string(),
+            draft: Draft::default(),
+            labels: crate::accounts::LABELS.to_vec(),
+            placeholders: crate::accounts::PLACEHOLDERS.to_vec(),
+            fields,
+            addr_fields: 0,
+            event: None,
+            account: Some(form),
+            note: note.to_string(),
+            body,
+            focus: 0,
+            mode: if spec.name.is_empty() { VMode::Insert } else { VMode::Normal },
+            command: None,
+            pending: None,
+            completions: vec![],
+            sel: None,
+            scroll: 0,
+            original: String::new(),
+        };
+        for f in c.fields.iter_mut() {
+            f.move_cursor(CursorMove::End);
+        }
+        c.original = c.snapshot();
+        c
+    }
+
+    /// Every single-line field's text, in order.
+    pub fn values(&self) -> Vec<String> {
+        self.fields.iter().map(|f| f.lines().join(" ").trim().to_string()).collect()
+    }
+
+    pub fn body_text(&self) -> String {
+        self.body.lines().join("\n").trim_end().to_string()
     }
 
     /// Read the event form back. Dates and times accept what quick add accepts.

@@ -97,6 +97,21 @@ line per paragraph, so phones and desktop clients each wrap it to fit.
 | `^t` `:a <file>` | attach |
 | `:e` | edit in `$EDITOR` full screen, then come back |
 
+## Accounts
+
+Settings → Accounts (`,` then `2`) lists your accounts. `a` adds one: pick
+Fastmail, Google, iCloud, Microsoft 365 or Other, and the form comes prefilled
+with that provider's servers, including the calendar and contacts servers, so one
+form sets up mail, calendar and contacts together. `⏎` edits an account and `d`
+removes it. Saving writes `config.toml` in place (your comments stay) and
+connects the account right away. Server fields take a port and, if the port
+doesn't imply it, a scheme: `imap://host:3143` for no encryption,
+`starttls://host:2525`.
+
+With more than one account, each one is a fold in the sidebar: `⏎`, `space`,
+`za` or a click on its heading opens or closes it, and `h` on a folder closes its
+account. A closed account shows its inbox's unread count. Folds are remembered.
+
 ## Calendar
 
 `C` switches between mail and the calendar. The calendar uses the same three
@@ -113,6 +128,9 @@ calendar keeps the color the server gives it.
 | `space` (sidebar) | show / hide a calendar |
 | `/` | filter events |
 | `o` | open the event's link (video call, etc.) |
+| `a` | quick add: `Lunch with Maya fri 12:30 1h @Osteria` |
+| `A` · `e` | new event / edit the selected one (form in the right pane) |
+| `d` | delete (asks first; a recurring event goes as a series) |
 | `$` | sync now (it also syncs every 15 minutes) |
 
 Add one `[[dav]]` block per server. tern finds every calendar and address book
@@ -128,7 +146,14 @@ password_cmd = "pass show mail/personal"   # or: account = "Personal" to reuse i
 
 Syncing only downloads what changed since the last sync when the server
 supports that, and the result is cached, so the calendar opens instantly and
-works offline. The calendar is read-only for now.
+works offline. Edits change only the title, times, place and notes, and keep
+everything else in the event (attendees, alarms, time zone) as it was.
+
+Meeting invitations show as a card at the top of the message: when, where, who
+is coming, your answer, and anything it overlaps in your calendars. `a` / `t` / `n`
+answer yes / maybe / no. That sends the organizer a standard reply, puts the
+event in your calendar (or takes it out on a no), and marks the message
+answered.
 
 ## OAuth (Gmail, Outlook)
 
@@ -216,5 +241,5 @@ doesn't merge in your Sent folder yet.
 
 ## Not yet
 
-Creating and editing events, replying to meeting invites from mail, Microsoft
-365 calendars (Graph), PGP, and sending HTML.
+Microsoft 365 calendars (Graph), editing single occurrences of a recurring
+event, PGP, and sending HTML.
