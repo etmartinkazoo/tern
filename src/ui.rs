@@ -245,6 +245,15 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         }
         lines.push(line);
     }
+    // Your day, under the folders: what's on now, then the rest of today and tomorrow.
+    if app.cfg.ui.agenda_in_mail {
+        let room = (r.height as usize).saturating_sub(lines.len() + 1);
+        let agenda = agenda_lines(app, w, room.min(8), t);
+        if agenda.len() > 1 {
+            lines.extend(std::iter::repeat_n(Line::from(""), room - agenda.len()));
+            lines.extend(agenda);
+        }
+    }
     f.render_widget(Paragraph::new(lines), r);
 }
 
@@ -1245,6 +1254,60 @@ fn draw_calendar(f: &mut Frame, app: &mut App, main: Rect, t: &Theme) {
     draw_cal_sidebar(f, app, side, t);
     draw_agenda(f, app, list, t);
     draw_event(f, app, body, t);
+}
+
+/// The next meetings for the mail sidebar: a heading and up to `max - 1` events.
+fn agenda_lines(app: &App, w: usize, max: usize, t: &Theme) -> Vec<Line<'static>> {
+    if max < 3 || app.cal.occ.is_empty() {
+        return vec![];
+    }
+    let now = crate::calendar::now();
+    let today = now.date_naive();
+    let tomorrow = today + chrono::Duration::days(1);
+    let mut next: Vec<&crate::calendar::Occurrence> = app
+        .cal
+        .occ
+        .iter()
+        .filter(|o| o.end > now && o.start.date_naive() <= tomorrow && app.cal.visible(o.calendar))
+        .collect();
+    next.sort_by_key(|o| (o.start.date_naive(), !o.all_day, o.start));
+    let mut out = vec![Line::from(vec![
+        Span::styled(" TODAY", Style::default().fg(t.muted).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {}", now.format("%a %e %b")), Style::default().fg(t.subtle)),
+    ])];
+    if next.is_empty() {
+        out.push(Line::from(Span::styled("  nothing more today", Style::default().fg(t.subtle))));
+        return out;
+    }
+    let mut last_day = today;
+    for o in next {
+        if out.len() >= max {
+            break;
+        }
+        let day = o.start.date_naive().max(today);
+        if day != last_day {
+            if out.len() + 2 > max {
+                break;
+            }
+            last_day = day;
+            out.push(Line::from(Span::styled(" TOMORROW", Style::default().fg(t.muted).add_modifier(Modifier::BOLD))));
+        }
+        let ongoing = o.start <= now;
+        let when = if o.all_day {
+            "all day".to_string()
+        } else if ongoing {
+            "now".to_string()
+        } else {
+            o.start.format("%H:%M").to_string()
+        };
+        let col = app.cal.calendars.get(o.calendar).map(|c| crate::calview::color(c, o.calendar, t)).unwrap_or(t.accent);
+        out.push(Line::from(vec![
+            Span::styled(" ▌", Style::default().fg(col)),
+            Span::styled(format!("{when:<6}"), Style::default().fg(if ongoing { t.green } else { t.muted }).add_modifier(if ongoing { Modifier::BOLD } else { Modifier::empty() })),
+            Span::styled(fit(&o.summary, w.saturating_sub(9)), Style::default().fg(if ongoing { t.fg } else { t.muted })),
+        ]));
+    }
+    out
 }
 
 fn draw_people(f: &mut Frame, app: &mut App, main: Rect, t: &Theme) {

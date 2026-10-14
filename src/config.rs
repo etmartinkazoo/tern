@@ -214,6 +214,9 @@ pub struct Ui {
     /// Seconds a sent message waits in the outbox, undoable with ^z. 0 sends at once.
     #[serde(default = "undo_send")]
     pub undo_send_secs: u64,
+    /// Show your next meetings under the folders in the mail view.
+    #[serde(default = "yes")]
+    pub agenda_in_mail: bool,
     /// Desktop notifications for new mail and upcoming meetings.
     #[serde(default = "yes")]
     pub notifications: bool,
