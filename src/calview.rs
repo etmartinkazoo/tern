@@ -40,6 +40,12 @@ pub struct CalState {
     pub synced_at: Option<Instant>,
     pub detail_scroll: usize,
     pending_g: bool,
+    /// "<source>/<id>" of the default calendar, from config.
+    pub default: Option<String>,
+    /// Whether the sidebar has focus (then its cursor picks where events go).
+    pub side_focused: bool,
+    /// Last sync failure per source, for the settings view.
+    pub source_errors: std::collections::HashMap<String, String>,
 }
 
 const BEFORE: i64 = 14;
@@ -68,6 +74,9 @@ impl CalState {
             synced_at: None,
             detail_scroll: 0,
             pending_g: false,
+            default: None,
+            side_focused: false,
+            source_errors: Default::default(),
         }
     }
 
@@ -217,8 +226,15 @@ impl CalState {
     /// Where new events go: the calendar under the sidebar cursor, else the selected
     /// event's, else the first visible one.
     pub fn target(&self) -> Option<usize> {
-        if let Some(Some(i)) = self.side_rows().get(self.side_cursor) {
-            return Some(*i);
+        if self.side_focused {
+            if let Some(Some(i)) = self.side_rows().get(self.side_cursor) {
+                return Some(*i);
+            }
+        }
+        if let Some(d) = &self.default {
+            if let Some(i) = self.calendars.iter().position(|c| format!("{}/{}", c.source, c.id) == *d) {
+                return Some(i);
+            }
         }
         if let Some(o) = self.selected() {
             return Some(o.calendar);
@@ -295,6 +311,10 @@ impl App {
                 self.say(format!("{} calendars · {n} events synced", self.cal.calendars.len()));
             }
         }
+        self.cal.source_errors = errors
+            .iter()
+            .filter_map(|e| e.split_once(": ").map(|(s, m)| (s.to_string(), m.to_string())))
+            .collect();
         if !errors.is_empty() {
             self.say_error(format!("calendar: {}", errors.join("; ")));
         }
@@ -303,6 +323,7 @@ impl App {
     /// Keys in the calendar view. Returns false for keys it leaves to the mail keymap
     /// (quit, settings, help).
     pub fn calendar_key(&mut self, k: KeyEvent) -> bool {
+        self.cal.side_focused = self.focus == Focus::Sidebar;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let g = std::mem::take(&mut self.cal.pending_g);
         let half = (self.cal.height / 2).max(1) as isize;
@@ -580,12 +601,33 @@ impl App {
 
     pub fn toggle_calendar(&mut self, side_row: usize) {
         let Some(Some(i)) = self.cal.side_rows().get(side_row).copied() else { return };
+        self.toggle_calendar_index(i);
+    }
+
+    /// Show or hide a calendar, and remember it in config.toml.
+    pub fn toggle_calendar_index(&mut self, i: usize) {
         let c = &self.cal.calendars[i];
         let key = (c.source.clone(), c.id.clone());
-        if !self.cal.hidden.remove(&key) {
-            self.cal.hidden.insert(key);
+        let hide = !self.cal.hidden.remove(&key);
+        if hide {
+            self.cal.hidden.insert(key.clone());
         }
         self.cal.expand();
+        let (src, id) = key;
+        if self.cfg.dav.iter().any(|d| d.name == src) {
+            self.edit_config(|t| crate::accounts::set_hidden(t, &src, &id, hide));
+        }
+    }
+
+    /// Make a calendar the one new events and accepted invitations go to.
+    pub fn set_default_calendar(&mut self, i: usize) {
+        let c = &self.cal.calendars[i];
+        let key = format!("{}/{}", c.source, c.id);
+        let name = c.name.clone();
+        self.cfg.ui.default_calendar = Some(key.clone());
+        if self.edit_config(|t| crate::accounts::set_default_calendar(t, &key)) {
+            self.say(format!("new events go to {name}"));
+        }
     }
 
     pub fn cal_filter(&mut self, q: &str) {

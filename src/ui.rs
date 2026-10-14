@@ -107,7 +107,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     app.hits = Hits::default();
 
-    let account_form = matches!(&app.mode, Mode::Compose(c) if c.account.is_some());
+    let account_form = matches!(&app.mode, Mode::Compose(c) if c.account.is_some() || c.source.is_some());
     if matches!(app.mode, Mode::Settings(_)) || account_form {
         draw_settings(f, app, main, &t);
     } else if app.screen == View::Calendar {
@@ -915,7 +915,7 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
     let row = |y: u16| Rect { x: r.x, y, width: r.width, height: 1 };
     f.render_widget(Paragraph::new(Line::from(head)), row(y));
     y += 1;
-    if c.event.is_none() && c.account.is_none() {
+    if c.is_mail() {
         f.render_widget(Paragraph::new(header_line("From", from, w, t)), row(y));
         y += 1;
     }
@@ -939,7 +939,7 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
     let mut focus_row = y;
     for i in 0..c.fields.len() {
         // Bcc stays out of the way until it has something or you go to it.
-        if c.event.is_none() && c.account.is_none() && i == composer::BCC && c.focus != i && c.fields[i].is_empty() {
+        if c.is_mail() && i == composer::BCC && c.focus != i && c.fields[i].is_empty() {
             continue;
         }
         let focused = c.focus == i;
@@ -1002,7 +1002,9 @@ fn draw_composer(f: &mut Frame, c: &mut Composer, active: bool, from: &str, r: R
         vec![Span::styled(k.to_string(), Style::default().fg(t.yellow)), Span::styled(format!(" {label}  "), Style::default().fg(t.subtle))]
     };
     let mut hint = vec![Span::raw(" ")];
-    let keys: &[(&str, &str)] = if c.account.is_some() {
+    let keys: &[(&str, &str)] = if c.source.is_some() {
+        &[("^s ZZ", "save"), (":q!", "cancel"), ("tab", "next field")]
+    } else if c.account.is_some() {
         &[("^s ZZ", "save"), (":q!", "cancel"), ("tab", "next field"), ("body", "= signature")]
     } else if c.event.is_some() {
         &[("^s ZZ", "save"), (":q!", "discard"), ("tab", "next field")]
@@ -1451,7 +1453,7 @@ fn draw_settings(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     draw_sep(f, sep, t);
 
     // Tabs down the left, like the folder sidebar.
-    let icons = ["\u{f013}", "\u{f007}", "\u{f11c}", "\u{f1fc}"];
+    let icons = ["\u{f013}", "\u{f007}", "\u{f073}", "\u{f11c}", "\u{f1fc}"];
     let mut lines = vec![Line::from(pane_title("Settings", true, t))];
     for (i, name) in settings::TABS.iter().enumerate() {
         let on = i == tab;
@@ -1484,13 +1486,14 @@ fn draw_settings(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     app.hits.settings_body = inner;
     // An account form opens over the tab's content.
     if let Mode::Compose(c) = &mut app.mode {
-        if c.account.is_some() {
+        if c.account.is_some() || c.source.is_some() {
             return draw_composer(f, c, true, "", inner, t);
         }
     }
     match tab {
         settings::GENERAL => draw_settings_general(f, app, inner, t, cursor, editing),
         settings::ACCOUNTS => draw_settings_accounts(f, app, inner, t),
+        settings::CALENDARS => draw_settings_calendars(f, app, inner, t),
         settings::KEYS => draw_settings_keys(f, app, inner, t, &filter, typing),
         settings::THEME => draw_settings_theme(f, app, inner, t),
         _ => {}
@@ -1666,17 +1669,107 @@ fn draw_settings_accounts(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
             lines.push(kv("Calendar", "none — edit to add a CalDAV URL".into(), t));
         }
     }
-    let other: Vec<_> = app.cfg.dav_sources().into_iter().filter(|d| d.account.is_none()).collect();
-    if !other.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(section_line("Other calendar & contacts sources", t));
-        for d in other {
-            lines.push(kv(&d.name, format!("{} · {}", d.url, d.username), t));
-        }
-    }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(format!("  {} contacts cached", app.contacts.len()), Style::default().fg(t.subtle))));
-    lines.push(Line::from(Span::styled("  a add · ⏎ edit · d remove", Style::default().fg(t.yellow))));
+    lines.push(Line::from(Span::styled("  a add · ⏎ edit · d remove · calendars and contacts: tab 3", Style::default().fg(t.yellow))));
+    scroll_render(f, app, r, lines);
+}
+
+fn draw_settings_calendars(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
+    let (cursor, picking, confirm) = match &app.mode {
+        Mode::Settings(st) => (st.dav_cursor, st.dav_picking, st.dav_confirm),
+        _ => (0, None, None),
+    };
+    let w = r.width as usize;
+    let mut lines = vec![Line::from("")];
+    if let Some(p) = picking {
+        lines.push(section_line("New calendar & contacts source · choose a server", t));
+        lines.push(Line::from(""));
+        for (i, (label, url)) in crate::accounts::DAV_PRESETS.iter().enumerate() {
+            let sel = i == p;
+            let mut l = Line::from(vec![
+                Span::styled(format!("  {}", pad(label, 28)), Style::default().fg(if sel { t.fg } else { t.muted }).add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(url.to_string(), Style::default().fg(t.subtle)),
+            ]);
+            if sel {
+                l = l.style(Style::default().bg(t.sel_bg));
+            }
+            lines.push(l);
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  ⏎ continue · esc cancel", Style::default().fg(t.yellow))));
+        return scroll_render(f, app, r, lines);
+    }
+
+    lines.push(section_line("Calendars & contacts", t));
+    let rows = app.dav_rows();
+    let cursor = cursor.min(rows.len().saturating_sub(1));
+    let default = app.cfg.ui.default_calendar.clone();
+    for (ri, row) in rows.iter().enumerate() {
+        let sel = ri == cursor;
+        let mut line = match *row {
+            crate::app::DavRow::Source(i) => {
+                let d = &app.cfg.dav[i];
+                let n = app.cal.calendars.iter().filter(|c| c.source == d.name).count();
+                let (status, sc) = match app.cal.source_errors.get(&d.name) {
+                    Some(e) => (fit(e, 40), t.red),
+                    None if app.cal.synced_at.is_none() => ("not synced yet · $".to_string(), t.subtle),
+                    None => (format!("{n} calendar{}", if n == 1 { "" } else { "s" }), t.subtle),
+                };
+                let via = match &d.account {
+                    Some(a) => format!(" · via {a}"),
+                    None => String::new(),
+                };
+                if ri > 0 {
+                    lines.push(Line::from(""));
+                }
+                Line::from(vec![
+                    Span::styled(format!("  {}", pad(&d.name, 22)), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
+                    Span::styled(fit(&format!("{} · {}{via}", d.url, d.username), w.saturating_sub(26 + status.width() + 3)), Style::default().fg(t.muted)),
+                    Span::styled(format!("  {status}"), Style::default().fg(sc)),
+                ])
+            }
+            crate::app::DavRow::Calendar(ci) => {
+                let c = &app.cal.calendars[ci];
+                let on = app.cal.visible(ci);
+                let col = crate::calview::color(c, ci, t);
+                let is_default = default.as_deref() == Some(format!("{}/{}", c.source, c.id).as_str());
+                Line::from(vec![
+                    Span::styled(if on { "     ● " } else { "     ○ " }, Style::default().fg(if on { col } else { t.subtle })),
+                    Span::styled(pad(&c.name, 26), Style::default().fg(if on { t.fg } else { t.subtle })),
+                    Span::styled(format!("{} events", c.items.len()), Style::default().fg(t.subtle)),
+                    Span::styled(if is_default { "   ★ default" } else { "" }, Style::default().fg(t.yellow)),
+                    Span::styled(if on { "" } else { "   hidden" }, Style::default().fg(t.subtle)),
+                ])
+            }
+            crate::app::DavRow::Add => {
+                lines.push(Line::from(""));
+                Line::from(Span::styled("  + add a calendar or contacts server", Style::default().fg(t.accent)))
+            }
+        };
+        if sel {
+            line = line.style(Style::default().bg(t.sel_bg));
+        }
+        lines.push(line);
+    }
+    if app.cfg.carddav.is_some() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  An old [carddav] block is also read; replace it with a source here to manage it.", Style::default().fg(t.subtle))));
+    }
+    lines.push(Line::from(""));
+    if let Some(i) = confirm {
+        lines.push(Line::from(Span::styled(
+            format!("  Remove {} from config.toml?  y yes · anything else no", app.cfg.dav[i].name),
+            Style::default().fg(t.red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(Span::styled(format!("  {} contacts cached", app.contacts.len()), Style::default().fg(t.subtle))));
+    let hint = match rows.get(cursor) {
+        Some(crate::app::DavRow::Calendar(_)) => "  space show/hide · * default for new events · $ sync",
+        Some(crate::app::DavRow::Source(_)) => "  ⏎ edit · d remove · a add · $ sync",
+        _ => "  ⏎ add · $ sync",
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(t.yellow))));
     scroll_render(f, app, r, lines);
 }
 

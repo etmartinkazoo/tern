@@ -79,6 +79,13 @@ pub struct AcctState {
     pub connected: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DavRow {
+    Source(usize),
+    Calendar(usize),
+    Add,
+}
+
 pub struct SideRow {
     pub acct: usize,
     pub folder: Option<usize>,
@@ -235,6 +242,7 @@ impl App {
     }
 
     pub fn start(&mut self) {
+        self.apply_calendar_config();
         self.threaded = self.cfg.ui.threads;
         self.fold_default = self.cfg.ui.collapse_threads;
         for a in &self.accts {
@@ -1787,6 +1795,153 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------- config edits
+
+    /// Rewrite config.toml through `f` (which keeps comments), then reload it. In demo
+    /// mode there's no file; nothing is written.
+    pub fn edit_config(&mut self, f: impl FnOnce(&str) -> anyhow::Result<String>) -> bool {
+        let Some(path) = self.cfg_path.clone() else { return true };
+        let r = std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|t| f(&t))
+            .and_then(|t| accounts::save(&path, &t))
+            .and_then(|_| crate::config::load(&path));
+        match r {
+            Ok(cfg) => {
+                self.cfg = cfg;
+                self.apply_calendar_config();
+                true
+            }
+            Err(e) => {
+                self.say_error(format!("{e:#}"));
+                false
+            }
+        }
+    }
+
+    /// Hidden calendars and the default, from config.
+    pub fn apply_calendar_config(&mut self) {
+        self.cal.hidden = self.cfg.dav.iter().flat_map(|d| d.hidden.iter().map(|h| (d.name.clone(), h.clone()))).collect();
+        self.cal.default = self.cfg.ui.default_calendar.clone();
+    }
+
+    // ---------------------------------------------------------------- calendar sources
+
+    /// Rows of the Calendars tab: each source, then its calendars; the last is "add".
+    pub fn dav_rows(&self) -> Vec<DavRow> {
+        let mut rows = Vec::new();
+        for (i, d) in self.cfg.dav.iter().enumerate() {
+            rows.push(DavRow::Source(i));
+            for (ci, c) in self.cal.calendars.iter().enumerate() {
+                if c.source == d.name {
+                    rows.push(DavRow::Calendar(ci));
+                }
+            }
+        }
+        rows.push(DavRow::Add);
+        rows
+    }
+
+    fn calendars_key(&mut self, k: KeyEvent) -> bool {
+        let rows = self.dav_rows();
+        let Mode::Settings(st) = &mut self.mode else { return false };
+        if let Some(i) = st.dav_confirm.take() {
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                let name = self.cfg.dav[i].name.clone();
+                if self.edit_config(|t| accounts::remove_dav(t, i)) {
+                    self.say(format!("removed {name}"));
+                    self.cal.syncing = false;
+                    self.sync_calendars();
+                    self.sync_contacts();
+                }
+            } else {
+                self.say("kept");
+            }
+            return true;
+        }
+        if let Some(p) = st.dav_picking {
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => st.dav_picking = Some((p + 1).min(accounts::DAV_PRESETS.len() - 1)),
+                KeyCode::Char('k') | KeyCode::Up => st.dav_picking = Some(p.saturating_sub(1)),
+                KeyCode::Enter | KeyCode::Char('l') => {
+                    st.dav_picking = None;
+                    self.open_source_form(None, p);
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => st.dav_picking = None,
+                _ => {}
+            }
+            return true;
+        }
+        let cur = st.dav_cursor.min(rows.len().saturating_sub(1));
+        match (k.code, rows.get(cur).copied()) {
+            (KeyCode::Char('j') | KeyCode::Down, _) => st.dav_cursor = (cur + 1).min(rows.len() - 1),
+            (KeyCode::Char('k') | KeyCode::Up, _) => st.dav_cursor = cur.saturating_sub(1),
+            (KeyCode::Char('a'), _) | (KeyCode::Enter, Some(DavRow::Add)) => st.dav_picking = Some(0),
+            (KeyCode::Enter | KeyCode::Char('e'), Some(DavRow::Source(i))) => self.open_source_form(Some(i), 0),
+            (KeyCode::Char('d'), Some(DavRow::Source(i))) => st.dav_confirm = Some(i),
+            (KeyCode::Char(' ') | KeyCode::Enter, Some(DavRow::Calendar(ci))) => self.toggle_calendar_index(ci),
+            (KeyCode::Char('*'), Some(DavRow::Calendar(ci))) => self.set_default_calendar(ci),
+            (KeyCode::Char('$'), _) => {
+                self.say("syncing calendars and contacts…");
+                self.cal.syncing = false;
+                self.sync_calendars();
+                self.sync_contacts();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn open_source_form(&mut self, index: Option<usize>, preset: usize) {
+        if self.cfg_path.is_none() {
+            return self.say("demo: sources can't be changed");
+        }
+        let (spec, title) = match index {
+            Some(i) => {
+                let s = accounts::DavSpec::from_config(&self.cfg, i);
+                let t = format!("Edit {}", s.name);
+                (s, t)
+            }
+            None => {
+                let (label, url) = accounts::DAV_PRESETS[preset];
+                // Most people add a server their mail account already signs in to.
+                let acct = self.cfg.accounts.first();
+                let spec = accounts::DavSpec {
+                    url: url.to_string(),
+                    username: acct.map(|a| a.email.clone()).unwrap_or_default(),
+                    account: acct.map(|a| a.name.clone()).unwrap_or_default(),
+                    ..Default::default()
+                };
+                (spec, format!("New source · {label}"))
+            }
+        };
+        let note = "Calendars and address books on the server are found automatically. Leave Password cmd empty to sign in as the account named below.";
+        let form = crate::composer::SourceForm { index, old_name: index.map(|i| self.cfg.dav[i].name.clone()) };
+        if let Mode::Settings(st) = std::mem::replace(&mut self.mode, Mode::Normal) {
+            self.parked_settings = Some(st);
+        }
+        self.mode = Mode::Compose(Box::new(Composer::new_source(&title, &spec, form, note)));
+    }
+
+    fn save_source(&mut self, c: Box<Composer>) {
+        let Some(form) = c.source.clone() else { return };
+        let spec = accounts::DavSpec::from_fields(&c.values());
+        if let Err(e) = spec.validate(&self.cfg, form.index) {
+            self.say_error(format!("{e:#}"));
+            self.mode = Mode::Compose(c);
+            return;
+        }
+        if !self.edit_config(|t| accounts::write_dav(t, form.index, form.old_name.as_deref(), &spec)) {
+            self.mode = Mode::Compose(c);
+            return;
+        }
+        self.restore_settings();
+        self.say(format!("saved {} · syncing…", spec.name));
+        self.cal.syncing = false;
+        self.sync_calendars();
+        self.sync_contacts();
+    }
+
     // ---------------------------------------------------------------- accounts
 
     /// Keys on the Accounts tab. Returns false for ones the general settings keys handle.
@@ -1960,6 +2115,9 @@ impl App {
         if matches!(&self.mode, Mode::Settings(st) if st.tab == settings::ACCOUNTS && st.editing.is_none()) && self.accounts_key(k) {
             return;
         }
+        if matches!(&self.mode, Mode::Settings(st) if st.tab == settings::CALENDARS) && self.calendars_key(k) {
+            return;
+        }
         let Mode::Settings(st) = &mut self.mode else { return };
         let rows = settings::general_rows();
         if let Some(buf) = st.editing.as_mut() {
@@ -2016,7 +2174,7 @@ impl App {
                 st.tab = (st.tab + settings::TABS.len() - 1) % settings::TABS.len();
                 st.scroll = 0;
             }
-            KeyCode::Char(c @ '1'..='4') => {
+            KeyCode::Char(c @ '1'..='5') => {
                 st.tab = c as usize - '1' as usize;
                 st.scroll = 0;
             }
@@ -2163,6 +2321,10 @@ impl App {
         match out {
             Outcome::None => {}
             Outcome::Say(s) => self.say(s),
+            Outcome::Send | Outcome::SaveDraft if matches!(&self.mode, Mode::Compose(c) if c.source.is_some()) => {
+                let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
+                self.save_source(c);
+            }
             Outcome::Send | Outcome::SaveDraft if matches!(&self.mode, Mode::Compose(c) if c.event.is_some()) => {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
                 self.save_event(c);
@@ -2171,14 +2333,14 @@ impl App {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
                 self.save_account(c);
             }
-            Outcome::Attach | Outcome::External if matches!(&self.mode, Mode::Compose(c) if c.event.is_some() || c.account.is_some()) => {
+            Outcome::Attach | Outcome::External if matches!(&self.mode, Mode::Compose(c) if !c.is_mail()) => {
                 self.say("not available for events");
             }
             Outcome::Send => {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
                 self.send_draft(c);
             }
-            Outcome::Discard if matches!(&self.mode, Mode::Compose(c) if c.account.is_some()) => {
+            Outcome::Discard if matches!(&self.mode, Mode::Compose(c) if c.account.is_some() || c.source.is_some()) => {
                 self.restore_settings();
                 self.say("not saved");
             }

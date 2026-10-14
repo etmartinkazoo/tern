@@ -5,11 +5,12 @@ use crate::config::Ui;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-pub const TABS: [&str; 4] = ["General", "Accounts", "Keys", "Theme"];
+pub const TABS: [&str; 5] = ["General", "Accounts", "Calendars", "Keys", "Theme"];
 pub const GENERAL: usize = 0;
 pub const ACCOUNTS: usize = 1;
-pub const KEYS: usize = 2;
-pub const THEME: usize = 3;
+pub const CALENDARS: usize = 2;
+pub const KEYS: usize = 3;
+pub const THEME: usize = 4;
 
 #[derive(Clone, Copy)]
 pub enum Kind {
@@ -58,6 +59,10 @@ pub struct Settings {
     pub picking: Option<usize>,
     /// Asking before removing this account.
     pub confirm: Option<usize>,
+    /// Calendars tab: selected row, provider chooser, removal question.
+    pub dav_cursor: usize,
+    pub dav_picking: Option<usize>,
+    pub dav_confirm: Option<usize>,
 }
 
 pub fn get(ui: &Ui, key: &str) -> String {

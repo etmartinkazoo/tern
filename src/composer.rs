@@ -21,6 +21,13 @@ pub struct AccountForm {
     pub save_sent: bool,
 }
 
+/// What a calendar/contacts source form is editing (index None = new).
+#[derive(Clone, Debug)]
+pub struct SourceForm {
+    pub index: Option<usize>,
+    pub old_name: Option<String>,
+}
+
 /// What an event form is editing: which calendar, and which resource (None = new).
 #[derive(Clone, Debug)]
 pub struct EventForm {
@@ -58,6 +65,8 @@ pub struct Composer {
     pub event: Option<EventForm>,
     /// Set when this form edits an account.
     pub account: Option<AccountForm>,
+    /// Set when this form edits a calendar/contacts source.
+    pub source: Option<SourceForm>,
     /// A line of guidance under the title.
     pub note: String,
     pub body: TextArea<'static>,
@@ -102,6 +111,7 @@ impl Composer {
             addr_fields: 3,
             event: None,
             account: None,
+            source: None,
             note: String::new(),
             body,
             focus,
@@ -145,6 +155,7 @@ impl Composer {
             addr_fields: 0,
             event: Some(form),
             account: None,
+            source: None,
             note: String::new(),
             body,
             focus: 0,
@@ -178,6 +189,7 @@ impl Composer {
             addr_fields: 0,
             event: None,
             account: Some(form),
+            source: None,
             note: note.to_string(),
             body,
             focus: 0,
@@ -194,6 +206,27 @@ impl Composer {
         }
         c.original = c.snapshot();
         c
+    }
+
+    /// A calendar/contacts server form.
+    pub fn new_source(title: &str, spec: &crate::accounts::DavSpec, form: SourceForm, note: &str) -> Self {
+        let mut c = Composer::new_account(title, &crate::accounts::Spec::default(), crate::composer::AccountForm { index: None, old_name: None, oauth: String::new(), save_sent: true }, note);
+        c.account = None;
+        c.source = Some(form);
+        c.labels = crate::accounts::DAV_LABELS.to_vec();
+        c.placeholders = crate::accounts::DAV_PLACEHOLDERS.to_vec();
+        c.fields = spec.fields().iter().map(|v| area(v)).collect();
+        for f in c.fields.iter_mut() {
+            f.move_cursor(CursorMove::End);
+        }
+        c.mode = if spec.name.is_empty() { VMode::Insert } else { VMode::Normal };
+        c.mark_saved();
+        c
+    }
+
+    /// A message form (not an event, account or source).
+    pub fn is_mail(&self) -> bool {
+        self.event.is_none() && self.account.is_none() && self.source.is_none()
     }
 
     /// Every single-line field's text, in order.
@@ -348,7 +381,9 @@ impl Composer {
             self.cur().cancel_selection();
             self.mode = VMode::Normal;
         }
-        self.focus = f.min(self.body_idx());
+        // A source form has no body to move into.
+        let last = if self.source.is_some() { self.fields.len() - 1 } else { self.body_idx() };
+        self.focus = f.min(last);
         self.completions.clear();
         self.sel = None;
     }

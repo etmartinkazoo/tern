@@ -120,6 +120,9 @@ pub struct Dav {
     /// this source has none of its own.
     #[serde(default)]
     pub account: Option<String>,
+    /// Calendars (by id) on this server not shown in the agenda.
+    #[serde(default)]
+    pub hidden: Vec<String>,
 }
 
 impl Config {
@@ -133,6 +136,7 @@ impl Config {
                 username: cd.username.clone(),
                 secret: cd.secret.clone(),
                 account: None,
+                hidden: vec![],
             });
         }
         v
@@ -204,6 +208,9 @@ pub struct Ui {
     /// Show each conversation as one row until opened with `za`.
     #[serde(default = "yes")]
     pub collapse_threads: bool,
+    /// Where new events and accepted invitations go: "<source>/<calendar id>".
+    #[serde(default)]
+    pub default_calendar: Option<String>,
 }
 
 impl Default for Ui {

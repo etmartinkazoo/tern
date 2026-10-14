@@ -459,3 +459,213 @@ mod tests {
         assert!(s.validate(&cfg, Some(1)).is_ok());
     }
 }
+
+// ------------------------------------------------------------------- calendar & contacts sources
+
+/// Servers for the Calendars tab's chooser: (label, URL).
+pub const DAV_PRESETS: &[(&str, &str)] = &[
+    ("Fastmail calendars", "https://caldav.fastmail.com/"),
+    ("Fastmail contacts", "https://carddav.fastmail.com/"),
+    ("iCloud calendars", "https://caldav.icloud.com/"),
+    ("iCloud contacts", "https://contacts.icloud.com/"),
+    ("Google calendar", "https://apidata.googleusercontent.com/caldav/v2/"),
+    ("Google contacts", "https://www.googleapis.com/.well-known/carddav"),
+    ("Nextcloud", "https://cloud.example.com/remote.php/dav/"),
+    ("Other CalDAV / CardDAV", ""),
+];
+
+pub const DAV_LABELS: [&str; 5] = ["Name", "URL", "Username", "Password cmd", "Account"];
+pub const DAV_PLACEHOLDERS: [&str; 5] = [
+    "Work calendar, Family…",
+    "any URL on the server; calendars and address books are found from it",
+    "usually your email address",
+    "pass show dav/work · empty to use the account's sign-in",
+    "a mail account whose sign-in (password or OAuth) to reuse",
+];
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DavSpec {
+    pub name: String,
+    pub url: String,
+    pub username: String,
+    pub password_cmd: String,
+    pub account: String,
+}
+
+impl DavSpec {
+    pub fn fields(&self) -> Vec<String> {
+        vec![self.name.clone(), self.url.clone(), self.username.clone(), self.password_cmd.clone(), self.account.clone()]
+    }
+
+    pub fn from_fields(f: &[String]) -> DavSpec {
+        let g = |i: usize| f.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
+        DavSpec { name: g(0), url: g(1), username: g(2), password_cmd: g(3), account: g(4) }
+    }
+
+    pub fn from_config(cfg: &Config, i: usize) -> DavSpec {
+        let d = &cfg.dav[i];
+        DavSpec {
+            name: d.name.clone(),
+            url: d.url.clone(),
+            username: d.username.clone(),
+            password_cmd: d.secret.password_cmd.clone().unwrap_or_default(),
+            account: d.account.clone().unwrap_or_default(),
+        }
+    }
+
+    pub fn validate(&self, cfg: &Config, editing: Option<usize>) -> Result<()> {
+        if self.name.is_empty() {
+            bail!("the source needs a name");
+        }
+        let url: url::Url = self.url.parse().map_err(|_| anyhow!("`{}` isn't a URL", self.url))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("the URL should start with https://");
+        }
+        if url.host_str().is_some_and(|h| h.contains("example.com")) {
+            bail!("put your own server in the URL");
+        }
+        if cfg.dav.iter().enumerate().any(|(i, d)| Some(i) != editing && d.name.eq_ignore_ascii_case(&self.name)) {
+            bail!("there's already a source called {}", self.name);
+        }
+        if !self.account.is_empty() && !cfg.accounts.iter().any(|a| a.name == self.account) {
+            bail!("no mail account called {}", self.account);
+        }
+        if self.account.is_empty() && self.password_cmd.is_empty() {
+            let had = editing.is_some_and(|i| cfg.dav[i].secret.password.is_some());
+            if !had {
+                bail!("give a password command, or the name of the account whose sign-in to use");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn dav_tables(doc: &mut DocumentMut) -> Result<&mut toml_edit::ArrayOfTables> {
+    if doc.get("dav").is_none() {
+        doc["dav"] = Item::ArrayOfTables(Default::default());
+    }
+    doc["dav"].as_array_of_tables_mut().ok_or_else(|| anyhow!("`dav` isn't [[dav]]"))
+}
+
+/// Add a source (`index` None) or update one.
+pub fn write_dav(text: &str, index: Option<usize>, old_name: Option<&str>, s: &DavSpec) -> Result<String> {
+    let mut doc: DocumentMut = text.parse().context("parsing config.toml")?;
+    let dav = dav_tables(&mut doc)?;
+    let t: &mut Table = match index {
+        Some(i) => dav.get_mut(i).ok_or_else(|| anyhow!("no source #{i}"))?,
+        None => {
+            dav.push(Table::new());
+            dav.get_mut(dav.len() - 1).unwrap()
+        }
+    };
+    t["name"] = value(&s.name);
+    t["url"] = value(&s.url);
+    t["username"] = value(&s.username);
+    if !s.password_cmd.is_empty() {
+        t["password_cmd"] = value(&s.password_cmd);
+        t.remove("password");
+    } else if !s.account.is_empty() {
+        t.remove("password_cmd");
+    }
+    set_or_remove(t, "account", &s.account);
+    // The default calendar names its source; follow a rename.
+    if let (Some(old), Some(ui)) = (old_name.filter(|o| *o != s.name), doc.get_mut("ui").and_then(|u| u.as_table_mut())) {
+        if let Some(d) = ui.get("default_calendar").and_then(|v| v.as_str()).map(String::from) {
+            if let Some(rest) = d.strip_prefix(&format!("{old}/")) {
+                ui["default_calendar"] = value(format!("{}/{rest}", s.name));
+            }
+        }
+    }
+    Ok(doc.to_string())
+}
+
+pub fn remove_dav(text: &str, i: usize) -> Result<String> {
+    let mut doc: DocumentMut = text.parse().context("parsing config.toml")?;
+    let dav = dav_tables(&mut doc)?;
+    dav.remove(i);
+    if dav.is_empty() {
+        doc.remove("dav");
+    }
+    Ok(doc.to_string())
+}
+
+/// Show or hide one calendar of a source.
+pub fn set_hidden(text: &str, source: &str, calendar: &str, hidden: bool) -> Result<String> {
+    let mut doc: DocumentMut = text.parse().context("parsing config.toml")?;
+    let dav = dav_tables(&mut doc)?;
+    let t = dav
+        .iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(source))
+        .ok_or_else(|| anyhow!("no source called {source} in config.toml"))?;
+    let mut list: Vec<String> = t
+        .get("hidden")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    list.retain(|x| x != calendar);
+    if hidden {
+        list.push(calendar.to_string());
+    }
+    if list.is_empty() {
+        t.remove("hidden");
+    } else {
+        t["hidden"] = value(toml_edit::Array::from_iter(list));
+    }
+    Ok(doc.to_string())
+}
+
+pub fn set_default_calendar(text: &str, key: &str) -> Result<String> {
+    let mut doc: DocumentMut = text.parse().context("parsing config.toml")?;
+    if doc.get("ui").is_none() {
+        doc["ui"] = toml_edit::table();
+    }
+    let ui = doc["ui"].as_table_mut().ok_or_else(|| anyhow!("[ui] isn't a table"))?;
+    ui["default_calendar"] = value(key);
+    Ok(doc.to_string())
+}
+
+#[cfg(test)]
+mod dav_tests {
+    use super::*;
+
+    const CFG: &str = "# keep\n[[accounts]]\nname = \"P\"\nemail = \"p@x.y\"\n[accounts.imap]\nhost = \"i\"\nusername = \"p\"\npassword = \"p\"\n[accounts.smtp]\nhost = \"s\"\nusername = \"p\"\npassword = \"p\"\n";
+
+    #[test]
+    fn add_hide_default_rename_remove() {
+        let s = DavSpec { name: "Family".into(), url: "https://caldav.icloud.com/".into(), username: "me@icloud.com".into(), password_cmd: "pass icloud".into(), account: String::new() };
+        let out = write_dav(CFG, None, None, &s).unwrap();
+        let out = set_hidden(&out, "Family", "birthdays", true).unwrap();
+        let out = set_default_calendar(&out, "Family/home").unwrap();
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.dav[0].hidden, vec!["birthdays"]);
+        assert_eq!(cfg.ui.default_calendar.as_deref(), Some("Family/home"));
+        assert!(out.starts_with("# keep"));
+
+        let mut s2 = DavSpec::from_config(&cfg, 0);
+        s2.name = "Home".into();
+        let out = write_dav(&out, Some(0), Some("Family"), &s2).unwrap();
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.dav[0].name, "Home");
+        assert_eq!(cfg.ui.default_calendar.as_deref(), Some("Home/home"));
+        assert_eq!(cfg.dav[0].hidden, vec!["birthdays"]);
+
+        let out = set_hidden(&out, "Home", "birthdays", false).unwrap();
+        assert!(!out.contains("hidden"));
+        let out = remove_dav(&out, 0).unwrap();
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert!(cfg.dav.is_empty());
+    }
+
+    #[test]
+    fn validates() {
+        let cfg: Config = toml::from_str(CFG).unwrap();
+        let mut s = DavSpec { name: "W".into(), url: "caldav.x.com".into(), username: "u".into(), ..Default::default() };
+        assert!(s.validate(&cfg, None).is_err());
+        s.url = "https://caldav.x.com/".into();
+        assert!(s.validate(&cfg, None).is_err(), "needs credentials");
+        s.account = "P".into();
+        assert!(s.validate(&cfg, None).is_ok());
+        s.account = "Nope".into();
+        assert!(s.validate(&cfg, None).is_err());
+    }
+}

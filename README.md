@@ -108,6 +108,15 @@ connects the account right away. Server fields take a port and, if the port
 doesn't imply it, a scheme: `imap://host:3143` for no encryption,
 `starttls://host:2525`.
 
+Settings → Calendars (`,` then `3`) manages calendar and contacts servers,
+including the ones created with an account. Each server shows the calendars
+found on it. On a calendar, `space` shows or hides it and `*` makes it the
+default for new events and accepted invitations. On a server, `⏎` edits it and
+`d` removes it. `a` adds a server (Fastmail, iCloud, Google, Nextcloud or any
+CalDAV/CardDAV URL), either with its own password command or reusing a mail
+account's sign-in. `$` syncs. Hidden calendars and the default are saved in
+`config.toml`, so the sidebar's `space` toggle is remembered too.
+
 With more than one account, each one is a fold in the sidebar: `⏎`, `space`,
 `za` or a click on its heading opens or closes it, and `h` on a folder closes its
 account. A closed account shows its inbox's unread count. Folds are remembered.

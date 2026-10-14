@@ -140,6 +140,8 @@ pub const KEYMAP: &[Section] = &[
             ("/", "filter keys"),
             ("esc q", "close"),
             ("a ⏎ d", "Accounts tab: add / edit / remove"),
+            ("a ⏎ d", "Calendars tab: add / edit / remove a server"),
+            ("space *", "Calendars tab: show / hide · default calendar"),
         ],
     },
 ];
