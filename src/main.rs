@@ -17,6 +17,7 @@ mod outbox;
 mod drafts;
 mod keys;
 mod parse;
+mod people;
 mod settings;
 mod theme;
 mod thread;
@@ -194,9 +195,9 @@ async fn run(cfg: config::Config, demo: bool, cfg_path: PathBuf) -> Result<()> {
     app.cfg_path = (!demo).then_some(cfg_path);
     if demo {
         app.contacts = vec![
-            contacts::Contact { name: "Maya Okafor".into(), emails: vec!["maya@northwind.io".into()], org: "Northwind".into() },
-            contacts::Contact { name: "Jonas Berg".into(), emails: vec!["jonas@berg.dev".into()], org: String::new() },
-            contacts::Contact { name: "Lena Fischer".into(), emails: vec!["lena@kleinwerk.de".into()], org: "Kleinwerk".into() },
+            contacts::Contact { name: "Maya Okafor".into(), emails: vec!["maya@northwind.io".into()], org: "Northwind".into(), phones: vec!["+1 415 555 0134".into()], note: "Runs product at Northwind.".into(), ..Default::default() },
+            contacts::Contact { name: "Jonas Berg".into(), emails: vec!["jonas@berg.dev".into()], ..Default::default() },
+            contacts::Contact { name: "Lena Fischer".into(), emails: vec!["lena@kleinwerk.de".into()], org: "Kleinwerk".into(), ..Default::default() },
         ];
     }
     app.start();

@@ -77,6 +77,8 @@ pub struct Composer {
     pub account: Option<AccountForm>,
     /// Set when this form edits a calendar/contacts source.
     pub source: Option<SourceForm>,
+    /// Set when this form edits a contact.
+    pub contact: Option<crate::people::ContactForm>,
     /// A line of guidance under the title.
     pub note: String,
     /// The account a message is sent from (None: the open folder's).
@@ -124,6 +126,7 @@ impl Composer {
             event: None,
             account: None,
             source: None,
+            contact: None,
             note: String::new(),
             from_acct: None,
             body,
@@ -169,6 +172,7 @@ impl Composer {
             event: Some(form),
             account: None,
             source: None,
+            contact: None,
             note: String::new(),
             from_acct: None,
             body,
@@ -204,6 +208,7 @@ impl Composer {
             event: None,
             account: Some(form),
             source: None,
+            contact: None,
             note: note.to_string(),
             from_acct: None,
             body,
@@ -239,9 +244,27 @@ impl Composer {
         c
     }
 
-    /// A message form (not an event, account or source).
+    /// A message form (not an event, account, source or contact).
     pub fn is_mail(&self) -> bool {
-        self.event.is_none() && self.account.is_none() && self.source.is_none()
+        self.event.is_none() && self.account.is_none() && self.source.is_none() && self.contact.is_none()
+    }
+
+    /// A generic form: labelled one-line fields over a body.
+    pub fn new_form(title: &str, labels: &[&'static str], placeholders: &[&'static str], values: &[String], body: &str, note: &str) -> Self {
+        let mut c = Composer::new_account(title, &crate::accounts::Spec::default(), AccountForm { index: None, old_name: None, oauth: String::new(), save_sent: true }, note);
+        c.account = None;
+        c.labels = labels.to_vec();
+        c.placeholders = placeholders.to_vec();
+        c.fields = values.iter().map(|v| area(v)).collect();
+        for f in c.fields.iter_mut() {
+            f.move_cursor(CursorMove::End);
+        }
+        let mut b = area(body);
+        b.move_cursor(CursorMove::Top);
+        c.body = b;
+        c.mode = if values.first().is_some_and(|v| v.is_empty()) { VMode::Insert } else { VMode::Normal };
+        c.mark_saved();
+        c
     }
 
     /// Replace a single-line field's text.

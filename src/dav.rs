@@ -204,7 +204,15 @@ pub fn sync_contacts(sources: &[Source]) -> Result<(Vec<Contact>, Vec<String>)> 
             for book in c.call("address books", |c| c.list_addressbooks())? {
                 let cards = c.call(&book.id, |c| c.list_cards(&book.id, &Default::default()))?;
                 for card in cards.cards {
-                    all.extend(parse_vcards(&String::from_utf8_lossy(&card.data)));
+                    let raw = String::from_utf8_lossy(&card.data).into_owned();
+                    for mut ct in parse_vcards(&raw) {
+                        ct.source = src.dav.name.clone();
+                        ct.book = book.id.clone();
+                        ct.id = last_segment(&card.id);
+                        ct.etag = card.etag.clone();
+                        ct.raw = raw.clone();
+                        all.push(ct);
+                    }
                 }
             }
             Ok(())
@@ -216,7 +224,7 @@ pub fn sync_contacts(sources: &[Source]) -> Result<(Vec<Contact>, Vec<String>)> 
     if all.is_empty() && !errors.is_empty() && errors.len() == sources.len() {
         bail!("{}", errors.join("; "));
     }
-    all.retain(|c| !c.emails.is_empty());
+    all.retain(|c| !c.name.is_empty() || !c.emails.is_empty());
     all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok((all, errors))
 }
@@ -561,6 +569,52 @@ pub async fn delete_event(cfg: crate::config::Config, source: String, target: (S
         let calendar = aim(&mut c, &target)?;
         c.call("deleting event", |c| c.delete_item(&calendar, &item, etag.as_deref()))?;
         Ok(())
+    })
+    .await?
+}
+
+// ------------------------------------------------------------------- writing contacts
+
+/// Create (`existing` None: in the first address book of the first source) or update a
+/// card, or delete it (`spec` None).
+pub async fn write_contact(
+    cfg: crate::config::Config,
+    existing: Option<crate::contacts::Contact>,
+    spec: Option<crate::contacts::Spec>,
+) -> Result<String> {
+    let source = match &existing {
+        Some(c) => cfg.dav_sources().into_iter().find(|d| d.name == c.source),
+        None => cfg.dav_sources().into_iter().next(),
+    }
+    .ok_or_else(|| anyhow!("no [[dav]] source to keep contacts in"))?;
+    let src = resolve(&source, &cfg).await?;
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        let mut c = client(&src)?;
+        c.home(Kind::Contacts)?;
+        match (existing, spec) {
+            (Some(ct), None) => {
+                c.call("deleting contact", |w| w.delete_card(&ct.book, &ct.id, ct.etag.as_deref()))?;
+                Ok(format!("deleted {}", ct.name))
+            }
+            (Some(ct), Some(s)) => {
+                let card = crate::contacts::vcard_edit(&ct.raw, &s).into_bytes();
+                c.call("saving contact", |w| w.update_card(&ct.book, &ct.id, card.clone(), ct.etag.as_deref()))
+                    .map_err(|e| anyhow!("{e:#} — it may have changed elsewhere; gc to sync, then try again"))?;
+                Ok(format!("saved {}", s.name))
+            }
+            (None, Some(s)) => {
+                let book = c
+                    .call("address books", |w| w.list_addressbooks())?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("{} has no address book", src.dav.name))?;
+                let uid = uuid::Uuid::new_v4().to_string();
+                let card = crate::contacts::vcard_new(&s, &uid).into_bytes();
+                c.call("creating contact", |w| w.create_card(&book.id, &format!("{uid}.vcf"), card.clone()))?;
+                Ok(format!("added {}", s.name))
+            }
+            (None, None) => Ok(String::new()),
+        }
     })
     .await?
 }

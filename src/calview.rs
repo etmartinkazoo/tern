@@ -27,6 +27,7 @@ pub enum CallTarget {
 pub enum View {
     Mail,
     Calendar,
+    People,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,8 +322,8 @@ impl CalState {
 impl App {
     pub fn toggle_view(&mut self) {
         self.screen = match self.screen {
-            View::Mail => View::Calendar,
             View::Calendar => View::Mail,
+            _ => View::Calendar,
         };
         if self.screen == View::Calendar {
             self.focus = Focus::List;

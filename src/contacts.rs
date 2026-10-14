@@ -5,12 +5,88 @@ use crate::config::cache_dir;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Contact {
     pub name: String,
     pub emails: Vec<String>,
     #[serde(default)]
     pub org: String,
+    #[serde(default)]
+    pub phones: Vec<String>,
+    #[serde(default)]
+    pub note: String,
+    /// Where it lives: [[dav]] source, address book, card resource, its ETag, and the
+    /// card as stored (edits keep everything tern doesn't touch).
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub book: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub raw: String,
+}
+
+/// What the contact form edits.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Spec {
+    pub name: String,
+    pub emails: Vec<String>,
+    pub phones: Vec<String>,
+    pub org: String,
+    pub note: String,
+}
+
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace(',', "\\,").replace(';', "\\;").replace('\n', "\\n")
+}
+
+fn spec_lines(s: &Spec) -> Vec<String> {
+    let (given, family) = s.name.rsplit_once(' ').unwrap_or((s.name.as_str(), ""));
+    let mut v = vec![format!("FN:{}", esc(&s.name)), format!("N:{};{};;;", esc(family), esc(given))];
+    for e in &s.emails {
+        v.push(format!("EMAIL;TYPE=INTERNET:{e}"));
+    }
+    for p in &s.phones {
+        v.push(format!("TEL:{p}"));
+    }
+    if !s.org.is_empty() {
+        v.push(format!("ORG:{}", esc(&s.org)));
+    }
+    if !s.note.trim().is_empty() {
+        v.push(format!("NOTE:{}", esc(s.note.trim())));
+    }
+    v
+}
+
+/// A new vCard 3.0.
+pub fn vcard_new(s: &Spec, uid: &str) -> String {
+    let mut lines = vec!["BEGIN:VCARD".to_string(), "VERSION:3.0".into(), format!("UID:{uid}")];
+    lines.extend(spec_lines(s));
+    lines.push("END:VCARD".into());
+    lines.join("\r\n") + "\r\n"
+}
+
+/// The stored card with tern's fields replaced and everything else kept.
+pub fn vcard_edit(raw: &str, s: &Spec) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for l in raw.replace("\r\n", "\n").split('\n') {
+        if (l.starts_with(' ') || l.starts_with('\t')) && !lines.is_empty() {
+            lines.last_mut().unwrap().push_str(&l[1..]);
+        } else if !l.is_empty() {
+            lines.push(l.to_string());
+        }
+    }
+    let ours = ["FN", "N", "EMAIL", "TEL", "ORG", "NOTE"];
+    let prop = |l: &str| l.split([';', ':']).next().unwrap_or("").rsplit('.').next().unwrap_or("").to_uppercase();
+    let mut out: Vec<String> = lines.into_iter().filter(|l| !ours.contains(&prop(l).as_str())).collect();
+    let end = out.iter().rposition(|l| l.eq_ignore_ascii_case("END:VCARD")).unwrap_or(out.len());
+    for (i, l) in spec_lines(s).into_iter().enumerate() {
+        out.insert(end + i, l);
+    }
+    out.join("\r\n") + "\r\n"
 }
 
 impl Contact {
@@ -91,7 +167,7 @@ pub fn parse_vcards(text: &str) -> Vec<Contact> {
         let prop = key.split(';').next().unwrap_or("").rsplit('.').next().unwrap_or("").to_uppercase();
         match prop.as_str() {
             "BEGIN" if value.eq_ignore_ascii_case("VCARD") => {
-                cur = Some(Contact { name: String::new(), emails: vec![], org: String::new() });
+                cur = Some(Contact::default());
                 n_field.clear();
             }
             "END" if value.eq_ignore_ascii_case("VCARD") => {
@@ -112,6 +188,19 @@ pub fn parse_vcards(text: &str) -> Vec<Contact> {
             "ORG" => {
                 if let Some(c) = cur.as_mut() {
                     c.org = unesc(value.split(';').next().unwrap_or("").trim());
+                }
+            }
+            "TEL" => {
+                if let Some(c) = cur.as_mut() {
+                    let t = value.trim().trim_start_matches("tel:").to_string();
+                    if !t.is_empty() {
+                        c.phones.push(t);
+                    }
+                }
+            }
+            "NOTE" => {
+                if let Some(c) = cur.as_mut() {
+                    c.note = value.trim().replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";");
                 }
             }
             "EMAIL" => {
@@ -141,11 +230,29 @@ mod tests {
     }
 
     #[test]
+    fn edits_keep_other_fields() {
+        let raw = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:u1\r\nFN:Ada\r\nitem1.EMAIL;TYPE=work:a@x\r\nitem1.X-ABLabel:work\r\nBDAY:1815-12-10\r\nPHOTO;VALUE=uri:https://x/p.jpg\r\nEND:VCARD\r\n";
+        let s = Spec { name: "Ada Lovelace".into(), emails: vec!["ada@x".into(), "a@x".into()], phones: vec!["+1 555".into()], org: "Analytical".into(), note: "met at, the club".into() };
+        let out = vcard_edit(raw, &s);
+        for keep in ["UID:u1", "BDAY:1815-12-10", "PHOTO;VALUE=uri:https://x/p.jpg", "END:VCARD"] {
+            assert!(out.contains(keep), "{out}");
+        }
+        let c = &parse_vcards(&out)[0];
+        assert_eq!(c.name, "Ada Lovelace");
+        assert_eq!(c.emails, vec!["ada@x", "a@x"]);
+        assert_eq!(c.phones, vec!["+1 555"]);
+        assert_eq!(c.note, "met at, the club");
+        assert!(out.trim_end().ends_with("END:VCARD"));
+        let n = &parse_vcards(&vcard_new(&s, "u2"))[0];
+        assert_eq!((n.name.as_str(), n.org.as_str()), ("Ada Lovelace", "Analytical"));
+    }
+
+    #[test]
     fn ranks_prefix_first() {
         let cs = vec![
-            Contact { name: "Bob Annie".into(), emails: vec!["b@x".into()], org: "".into() },
-            Contact { name: "Ann Lee".into(), emails: vec!["ann@x".into()], org: "".into() },
-            Contact { name: "Joanna".into(), emails: vec!["j@x".into()], org: "".into() },
+            Contact { name: "Bob Annie".into(), emails: vec!["b@x".into()], ..Default::default() },
+            Contact { name: "Ann Lee".into(), emails: vec!["ann@x".into()], ..Default::default() },
+            Contact { name: "Joanna".into(), emails: vec!["j@x".into()], ..Default::default() },
         ];
         let r = query(&cs, "ann");
         assert_eq!(r[0].0.name, "Ann Lee");

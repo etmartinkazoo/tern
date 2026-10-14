@@ -27,6 +27,7 @@ pub enum Focus {
 pub enum PromptKind {
     Filter,
     CalFilter,
+    PeopleFilter,
     QuickAdd,
     ConfirmDelete,
     Move,
@@ -161,6 +162,7 @@ pub struct App {
     pub conv_jump: bool,
     pub screen: crate::calview::View,
     pub cal: crate::calview::CalState,
+    pub people: crate::people::PeopleState,
     /// The settings view, set aside while an account form is open over it.
     pub parked_settings: Option<Box<Settings>>,
     /// Unified inbox bookkeeping: view ids ⇄ (account, uid), per-account totals.
@@ -240,6 +242,7 @@ impl App {
             demo: false,
             cfg_path: None,
             parked_settings: None,
+            people: Default::default(),
             collapsed: load_ui_state(),
             undo: None,
             ids: HashMap::new(),
@@ -289,6 +292,34 @@ impl App {
         let stale = contacts::cache_age().is_none_or(|a| a > Duration::from_secs(3600));
         if stale {
             self.sync_contacts();
+        }
+    }
+
+    pub fn refresh_contacts(&mut self) {
+        self.sync_contacts();
+    }
+
+    /// A new message to `to`, from the account in view, with its signature.
+    pub fn write_to(&mut self, to: &str) {
+        let body = self.accts.get(self.acct_idx()).and_then(|a| a.cfg.signature.as_deref()).map(|s| format!("\n\n{s}")).unwrap_or_default();
+        self.compose("New message", Draft { to: to.to_string(), body, ..Default::default() });
+        if let Mode::Compose(c) = &mut self.mode {
+            c.focus = crate::composer::SUBJECT;
+        }
+    }
+
+    pub fn copy_text(&mut self, text: &str) {
+        let ok = std::process::Command::new("wl-copy")
+            .arg(text)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            self.say(format!("copied {text}"));
+        } else {
+            self.say_error("wl-copy not available");
         }
     }
 
@@ -829,6 +860,7 @@ impl App {
                 self.sync_calendars();
             }
             Event::OutboxResult(id, r) => self.on_outbox_result(id, r),
+            Event::Note(s) => self.say(s),
         }
     }
 
@@ -939,6 +971,16 @@ impl App {
         if ctrl(&k) && k.code == KeyCode::Char('z') {
             return self.undo_send();
         }
+        if self.screen == crate::calview::View::People {
+            if self.people_key(k) {
+                return;
+            }
+            let global = matches!(k.code, KeyCode::Char('q') | KeyCode::Char(',') | KeyCode::Char('?'))
+                || (ctrl(&k) && k.code == KeyCode::Char('c'));
+            if !global {
+                return;
+            }
+        }
         if self.screen == crate::calview::View::Calendar {
             if self.calendar_key(k) {
                 return;
@@ -1020,6 +1062,7 @@ impl App {
             KeyCode::Char('?') => self.open_settings(settings::KEYS),
             KeyCode::Char(',') => self.open_settings(settings::GENERAL),
             KeyCode::Char('C') => self.toggle_view(),
+            KeyCode::Char('P') => self.toggle_people(),
             KeyCode::Char('g') => self.pending = Some('g'),
 
             KeyCode::Char('j') | KeyCode::Down => self.down(n as isize),
@@ -1702,7 +1745,7 @@ impl App {
         let c = match kind {
             PromptKind::Move => self.folder_completions(&input),
             PromptKind::Attach => Self::path_completions(&input),
-            PromptKind::Filter | PromptKind::CalFilter | PromptKind::QuickAdd | PromptKind::ConfirmDelete => vec![],
+            PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter | PromptKind::QuickAdd | PromptKind::ConfirmDelete => vec![],
         };
         if let Mode::Prompt(p) = &mut self.mode {
             p.sel = match kind {
@@ -1798,6 +1841,14 @@ impl App {
     }
 
     fn after_prompt_edit(&mut self, kind: PromptKind) {
+        if kind == PromptKind::PeopleFilter {
+            if let Mode::Prompt(p) = &self.mode {
+                self.people.filter = p.input.clone();
+                self.people.cursor = 0;
+                self.people.offset = 0;
+            }
+            return;
+        }
         if kind == PromptKind::CalFilter {
             let q = match &self.mode {
                 Mode::Prompt(p) => p.input.clone(),
@@ -1838,6 +1889,7 @@ impl App {
                 }
             }
             PromptKind::CalFilter => self.cal_filter(&p.input),
+            PromptKind::PeopleFilter => self.people.filter = p.input.trim().to_string(),
             PromptKind::QuickAdd => self.quick_add(&p.input),
             PromptKind::ConfirmDelete => {}
             PromptKind::Move => {
@@ -2537,6 +2589,10 @@ impl App {
             Outcome::Call(call) => self.add_call(call, crate::calview::CallTarget::Form),
             Outcome::CycleFrom => self.cycle_from(),
             Outcome::Say(s) => self.say(s),
+            Outcome::Send | Outcome::SaveDraft if matches!(&self.mode, Mode::Compose(c) if c.contact.is_some()) => {
+                let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
+                self.save_contact(c);
+            }
             Outcome::Send | Outcome::SaveDraft if matches!(&self.mode, Mode::Compose(c) if c.source.is_some()) => {
                 let Mode::Compose(c) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
                 self.save_source(c);

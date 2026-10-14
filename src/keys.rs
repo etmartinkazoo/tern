@@ -79,6 +79,7 @@ pub const KEYMAP: &[Section] = &[
         title: "Calendar",
         keys: &[
             ("C", "switch between mail and calendar"),
+            ("P", "people: contacts, with mail and meetings shared"),
             ("j k", "next / previous event"),
             ("h l", "previous / next day"),
             ("H L", "previous / next week"),

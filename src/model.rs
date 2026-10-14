@@ -140,6 +140,8 @@ pub enum Event {
     Contacts(Vec<crate::contacts::Contact>),
     /// Calendars after a sync, and any sources that failed.
     Calendars(Vec<crate::dav::CachedCalendar>, Vec<String>),
+    /// Something to tell the user once a background job finishes.
+    Note(String),
     /// A call link was made (or not) for an event.
     CallLink(Result<String, String>, crate::calview::CallTarget),
     /// A calendar write finished: what was done, or why it failed.

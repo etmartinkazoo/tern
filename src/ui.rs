@@ -112,6 +112,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_settings(f, app, main, &t);
     } else if app.screen == View::Calendar {
         draw_calendar(f, app, main, &t);
+    } else if app.screen == View::People {
+        draw_people(f, app, main, &t);
     } else if app.zoom {
         app.hits.body = main;
         draw_body(f, app, main, &t);
@@ -1083,13 +1085,14 @@ fn draw_composer_with(f: &mut Frame, c: &mut Composer, active: bool, from: &str,
 fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
     let (mode, mode_c) = match &app.mode {
         Mode::Normal if app.screen == View::Calendar => ("CALENDAR", t.magenta),
+        Mode::Normal if app.screen == View::People => ("PEOPLE", t.green),
         Mode::Normal => match app.focus {
             Focus::Sidebar => ("FOLDERS", t.blue),
             Focus::List => ("MAIL", t.accent),
             Focus::Body => ("READ", t.green),
         },
         Mode::Prompt(p) => match p.kind {
-            PromptKind::Filter | PromptKind::CalFilter => ("SEARCH", t.yellow),
+            PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter => ("SEARCH", t.yellow),
             PromptKind::QuickAdd => ("ADD", t.green),
             PromptKind::ConfirmDelete => ("DELETE?", t.red),
             PromptKind::Move => ("MOVE", t.magenta),
@@ -1117,7 +1120,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
     }
     if let Mode::Prompt(p) = &app.mode {
         let label = match p.kind {
-            PromptKind::Filter | PromptKind::CalFilter => " /",
+            PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter => " /",
             PromptKind::QuickAdd => " add:",
             PromptKind::ConfirmDelete => "",
             PromptKind::Move => " move to:",
@@ -1129,6 +1132,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
         let hint = match p.kind {
             PromptKind::Filter => "  enter: also search server · esc: clear",
             PromptKind::CalFilter => "  filters events as you type · esc: clear",
+            PromptKind::PeopleFilter => "  name, email, company or phone · esc: clear",
             PromptKind::QuickAdd => "  e.g. Lunch with Maya fri 12:30 1h @Osteria · enter adds",
             PromptKind::ConfirmDelete => "  y deletes · anything else keeps it",
             PromptKind::Move | PromptKind::Attach => "  tab: complete · ↑↓ pick · enter: ok",
@@ -1241,6 +1245,146 @@ fn draw_calendar(f: &mut Frame, app: &mut App, main: Rect, t: &Theme) {
     draw_cal_sidebar(f, app, side, t);
     draw_agenda(f, app, list, t);
     draw_event(f, app, body, t);
+}
+
+fn draw_people(f: &mut Frame, app: &mut App, main: Rect, t: &Theme) {
+    let side_w = app.cfg.ui.sidebar_width.min(main.width / 4).max(14);
+    let rest = main.width.saturating_sub(side_w + 2);
+    let list_w = (rest as u32 * app.cfg.ui.list_percent.clamp(20, 80) as u32 / 100) as u16;
+    let [side, s1, list, s2, body] = Layout::horizontal([
+        Constraint::Length(side_w),
+        Constraint::Length(1),
+        Constraint::Length(list_w),
+        Constraint::Length(1),
+        Constraint::Min(10),
+    ])
+    .areas(main);
+    app.hits = Hits { side, list, body, ..Default::default() };
+    draw_sep(f, s1, t);
+    draw_sep(f, s2, t);
+
+    // Left: what's there and how to act on it.
+    let mut lines = vec![Line::from(pane_title("People", false, t)), Line::from("")];
+    let mut sources: Vec<(String, usize)> = Vec::new();
+    for c in &app.contacts {
+        let s = if c.source.is_empty() { "cached".to_string() } else { c.source.clone() };
+        match sources.iter_mut().find(|(n, _)| *n == s) {
+            Some(x) => x.1 += 1,
+            None => sources.push((s, 1)),
+        }
+    }
+    for (s, n) in sources {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {}", pad(&s, side.width.saturating_sub(7) as usize)), Style::default().fg(t.muted)),
+            Span::styled(format!("{n:>4}"), Style::default().fg(t.subtle)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    for (k, d) in [("⏎ m", "write"), ("a", "add"), ("e", "edit"), ("d", "delete"), ("y", "copy email"), ("/", "search"), ("$", "sync")] {
+        lines.push(Line::from(vec![Span::styled(format!(" {k:>4} "), Style::default().fg(t.yellow)), Span::styled(d, Style::default().fg(t.subtle))]));
+    }
+    f.render_widget(Paragraph::new(lines), side);
+
+    // Middle: the list.
+    let focused = app.focus != Focus::Body;
+    app.people.height = list.height.saturating_sub(1) as usize;
+    let people = app.people();
+    let n = people.len();
+    let mut head = vec![pane_title("Contacts", focused, t), Span::styled(format!("  {n}"), Style::default().fg(t.subtle))];
+    if !app.people.filter.is_empty() {
+        head.push(Span::styled(format!("  /{}", app.people.filter), Style::default().fg(t.yellow)));
+    }
+    let mut rows = vec![Line::from(head)];
+    let w = list.width as usize;
+    let name_w = (w * 2 / 5).max(12);
+    if n == 0 {
+        rows.push(Line::from(""));
+        let msg = if app.contacts.is_empty() { "  no contacts yet — a adds one, $ syncs" } else { "  no matches" };
+        rows.push(Line::from(Span::styled(msg, Style::default().fg(t.subtle))));
+    }
+    for (i, c) in people.iter().enumerate().skip(app.people.offset).take(app.people.height) {
+        let detail = c.emails.first().cloned().or_else(|| c.phones.first().cloned()).unwrap_or_default();
+        let mut l = Line::from(vec![
+            Span::styled(format!(" {}", pad(if c.name.is_empty() { &detail } else { &c.name }, name_w)), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
+            Span::styled(pad(&detail, w.saturating_sub(name_w + 2 + 14)), Style::default().fg(t.muted)),
+            Span::styled(rpad(&fit(&c.org, 13), 14), Style::default().fg(t.subtle)),
+        ]);
+        if i == app.people.cursor {
+            l = l.style(Style::default().bg(if focused { t.sel_bg } else { mix(t.sel_bg, t.bg, 0.5) }));
+        }
+        rows.push(l);
+    }
+    f.render_widget(Paragraph::new(rows), list);
+
+    // Right: a form when one is open, else the person and what you share with them.
+    let from = app.accts.get(app.compose_acct()).map(|a| a.cfg.sender_mailbox()).unwrap_or_default();
+    let active = matches!(app.mode, Mode::Compose(_));
+    let switchable = app.accts.len() > 1;
+    if let Some(c) = app.composer_mut() {
+        return draw_composer_with(f, c, active, &from, switchable, body, t);
+    }
+    let Some(c) = app.selected_person() else { return };
+    let bw = body.width as usize;
+    let mut d = vec![Line::from(Span::styled(format!(" {}", c.name), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)))];
+    if !c.org.is_empty() {
+        d.push(Line::from(Span::styled(format!(" {}", c.org), Style::default().fg(t.muted))));
+    }
+    if app.people.confirm {
+        d.push(Line::from(Span::styled(format!(" Delete {} from your contacts?  y yes · anything else no", c.name), Style::default().fg(t.red).add_modifier(Modifier::BOLD))));
+    }
+    d.push(Line::from(Span::styled(format!(" {}", "─".repeat(bw.saturating_sub(2))), Style::default().fg(mix(t.subtle, t.bg, 0.4)))));
+    for (i, e) in c.emails.iter().enumerate() {
+        d.push(Line::from(vec![Span::styled(format!(" {:<10}", if i == 0 { "Email" } else { "" }), Style::default().fg(t.subtle)), Span::styled(e.clone(), Style::default().fg(t.fg))]));
+    }
+    for (i, p) in c.phones.iter().enumerate() {
+        d.push(Line::from(vec![Span::styled(format!(" {:<10}", if i == 0 { "Phone" } else { "" }), Style::default().fg(t.subtle)), Span::styled(p.clone(), Style::default().fg(t.fg))]));
+    }
+    if !c.note.trim().is_empty() {
+        d.push(Line::from(""));
+        for l in textwrap::wrap(c.note.trim(), bw.saturating_sub(3).max(10)) {
+            d.push(Line::from(Span::styled(format!(" {l}"), Style::default().fg(t.muted))));
+        }
+    }
+    let emails: Vec<String> = c.emails.iter().map(|e| e.to_lowercase()).collect();
+    let involves = |s: &str| {
+        let s = s.to_lowercase();
+        emails.iter().any(|e| s.contains(e.as_str()))
+    };
+    // Meetings ahead with them, from the calendars.
+    let now = crate::calendar::now();
+    let mut meets: Vec<&crate::calendar::Occurrence> = app
+        .cal
+        .occ
+        .iter()
+        .filter(|o| o.end >= now && (involves(&o.organizer) || o.attendees.iter().any(|a| involves(a))))
+        .collect();
+    meets.sort_by_key(|o| o.start);
+    if !meets.is_empty() {
+        d.push(Line::from(""));
+        d.push(Line::from(Span::styled(" UPCOMING", Style::default().fg(t.accent).add_modifier(Modifier::BOLD))));
+        for o in meets.into_iter().take(5) {
+            d.push(Line::from(vec![
+                Span::styled(format!(" {:<18}", o.start.format("%a %e %b %H:%M").to_string()), Style::default().fg(t.subtle)),
+                Span::styled(fit(&o.summary, bw.saturating_sub(19)), Style::default().fg(t.fg)),
+            ]));
+        }
+    }
+    // Recent mail with them, from what's loaded.
+    let mut mail: Vec<&crate::model::Envelope> = app.all.iter().filter(|e| involves(&e.from_addr) || involves(&e.to)).collect();
+    mail.sort_by(|a, b| b.date.cmp(&a.date));
+    if !mail.is_empty() {
+        d.push(Line::from(""));
+        d.push(Line::from(Span::styled(" RECENT MAIL", Style::default().fg(t.accent).add_modifier(Modifier::BOLD))));
+        for e in mail.into_iter().take(8) {
+            let dot = if e.seen { "  " } else { "● " };
+            d.push(Line::from(vec![
+                Span::styled(format!(" {dot}"), Style::default().fg(t.accent)),
+                Span::styled(format!("{:<7}", short_date(e.date, &app.cfg.ui.date_format)), Style::default().fg(t.subtle)),
+                Span::styled(fit(&e.subject, bw.saturating_sub(12)), Style::default().fg(if e.seen { t.muted } else { t.fg })),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(d), body);
 }
 
 fn draw_cal_sidebar(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
