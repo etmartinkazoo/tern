@@ -68,6 +68,7 @@ pub const KEYMAP: &[Section] = &[
             ("r R", "reply / reply all"),
             ("f", "forward (keeps attachments)"),
             ("H", "show this message as HTML / as text"),
+            ("I", "load remote pictures in this message"),
             ("a t n", "meeting invite: yes / maybe / no"),
             ("o", "open the message in the browser"),
             ("L gx", "links: enter opens one, ^y copies it"),

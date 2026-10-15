@@ -71,6 +71,17 @@ pub struct Attachment {
     pub size: usize,
 }
 
+/// A picture carried in the message itself, inline or attached.
+#[derive(Debug, Clone)]
+pub struct Img {
+    /// Hash of the data; keys the decoded picture.
+    pub id: u64,
+    /// Content-ID without angle brackets, as `cid:` references name it.
+    pub cid: String,
+    pub name: String,
+    pub data: std::sync::Arc<Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Body {
     pub uid: u32,
@@ -85,6 +96,7 @@ pub struct Body {
     pub text: String,
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
+    pub images: Vec<Img>,
     pub list_unsubscribe: Option<String>,
     /// A meeting invitation (text/calendar part), raw.
     pub invite: Option<String>,
@@ -156,4 +168,6 @@ pub enum Event {
     CalWrite(Result<String, String>),
     /// The outbox tried a message: sent, or why not.
     OutboxResult(String, Result<(), String>),
+    /// A picture finished loading (None: it couldn't be fetched or decoded).
+    Image(u64, Option<image::DynamicImage>),
 }

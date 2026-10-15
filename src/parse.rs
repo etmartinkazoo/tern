@@ -1,6 +1,6 @@
 //! Turning raw RFC 822 bytes into the models the UI draws.
 
-use crate::model::{Attachment, Body, Envelope};
+use crate::model::{Attachment, Body, Envelope, Img};
 use chrono::{DateTime, Local};
 use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders, PartType};
 
@@ -102,6 +102,7 @@ pub fn body(uid: u32, raw: Vec<u8>) -> Body {
             text: String::from_utf8_lossy(&raw).into_owned(),
             html: None,
             attachments: vec![],
+            images: vec![],
             list_unsubscribe: None,
             invite: None,
             raw,
@@ -149,6 +150,18 @@ pub fn body(uid: u32, raw: Vec<u8>) -> Body {
         })
         .collect();
 
+    let images = msg
+        .parts
+        .iter()
+        .filter(|p| p.content_type().is_some_and(|c| c.ctype().eq_ignore_ascii_case("image")))
+        .map(|p| Img {
+            id: crate::images::hash(p.contents()),
+            cid: p.content_id().unwrap_or("").trim_matches(['<', '>']).to_string(),
+            name: p.attachment_name().unwrap_or("").to_string(),
+            data: std::sync::Arc::new(p.contents().to_vec()),
+        })
+        .collect();
+
     let list_unsubscribe = match msg.list_unsubscribe() {
         HeaderValue::Address(a) => a.first().and_then(|x| x.address()).map(|s| s.to_string()),
         HeaderValue::Text(t) => Some(t.to_string()),
@@ -181,6 +194,7 @@ pub fn body(uid: u32, raw: Vec<u8>) -> Body {
         text: tidy(&text),
         html,
         attachments,
+        images,
         list_unsubscribe,
         invite,
         raw: Vec::new(),

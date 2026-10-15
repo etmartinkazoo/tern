@@ -11,6 +11,7 @@ mod dav;
 mod demo;
 mod doctor;
 mod imap;
+mod images;
 mod meet;
 mod model;
 mod notify;
@@ -226,6 +227,7 @@ async fn run(cfg: config::Config, demo: bool, cfg_path: PathBuf) -> Result<()> {
     if !app.cfg.ui.mouse {
         let _ = execute!(stdout(), DisableMouseCapture);
     }
+    app.images.set_picker(images::picker(app.theme.bg));
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
     term.clear()?;
 
@@ -257,6 +259,11 @@ async fn run(cfg: config::Config, demo: bool, cfg_path: PathBuf) -> Result<()> {
                     Action::Quit => return Ok(()),
                     Action::Mouse(on) => {
                         let _ = if on { execute!(stdout(), EnableMouseCapture) } else { execute!(stdout(), DisableMouseCapture) };
+                    }
+                    Action::Copy(text) => {
+                        copy(&text);
+                        let n = text.lines().count();
+                        app.say(if n > 1 { format!("copied {n} lines") } else { format!("copied {} chars", text.chars().count()) });
                     }
                     Action::Open(target) => {
                         let _ = std::process::Command::new("xdg-open")
@@ -292,10 +299,43 @@ async fn run(cfg: config::Config, demo: bool, cfg_path: PathBuf) -> Result<()> {
     result
 }
 
+/// Puts text on the clipboard through the terminal (OSC 52, which also reaches across ssh)
+/// and, on a local desktop, through wl-copy or xclip for terminals that ignore OSC 52.
+fn copy(text: &str) {
+    use std::io::Write;
+    use base64::Engine;
+    let _ = write!(stdout(), "\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text));
+    let _ = stdout().flush();
+    let tool: Option<(&str, &[&str])> = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        Some(("wl-copy", &[]))
+    } else if std::env::var_os("DISPLAY").is_some() {
+        Some(("xclip", &["-selection", "clipboard"]))
+    } else if cfg!(target_os = "macos") {
+        Some(("pbcopy", &[]))
+    } else {
+        None
+    };
+    let Some((cmd, args)) = tool else { return };
+    let child = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Ok(mut child) = child {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        // Reap it off the UI thread; xclip stays up until something else owns the clipboard.
+        std::thread::spawn(move || child.wait());
+    }
+}
+
 fn handle_input(app: &mut App, ev: CEvent) {
     match ev {
         CEvent::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
         CEvent::Mouse(m) => app.on_mouse(m),
+        CEvent::Resize(..) => app.images.set_picker(images::picker(app.theme.bg)),
         _ => {}
     }
 }

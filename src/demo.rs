@@ -1,7 +1,7 @@
 //! `tern --demo`: an in-memory account so the UI can be explored (and screenshotted)
 //! without a mail server.
 
-use crate::model::{Attachment, Body, Cmd, Envelope, Event, Folder, Role};
+use crate::model::{Attachment, Body, Cmd, Envelope, Event, Folder, Img, Role};
 use chrono::{Duration, Local};
 use std::collections::HashMap;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -98,7 +98,13 @@ fn demo_body(v: &[Envelope], texts: &HashMap<u32, String>, uid: u32) -> Option<B
     } else {
         vec![]
     };
-    let own = texts.get(&uid).cloned().unwrap_or_else(|| find(&e.subject).map(|c| c.3.to_string()).unwrap_or_default());
+    let mut own = texts.get(&uid).cloned().unwrap_or_else(|| find(&e.subject).map(|c| c.3.to_string()).unwrap_or_default());
+    let mut images = vec![];
+    if e.subject.starts_with("Photos") {
+        own = own.replacen("\n\nCall Sunday?", "\n\n[image: lake.png]\n\nCall Sunday?", 1);
+        let data = lake();
+        images.push(Img { id: crate::images::hash(&*data), cid: String::new(), name: "lake.png".into(), data });
+    }
     let text = match v.iter().find(|p| !e.in_reply_to.is_empty() && p.message_id == e.in_reply_to) {
         Some(p) => {
             let prev = texts.get(&p.uid).cloned().unwrap_or_else(|| find(&p.subject).map(|c| c.3.to_string()).unwrap_or_default());
@@ -125,10 +131,48 @@ fn demo_body(v: &[Envelope], texts: &HashMap<u32, String>, uid: u32) -> Option<B
         text,
         html: None,
         attachments,
+        images,
         list_unsubscribe: None,
         invite: None,
         raw: vec![],
     })
+}
+
+/// A sunset over a lake, drawn rather than shipped.
+fn lake() -> std::sync::Arc<Vec<u8>> {
+    static PNG: std::sync::OnceLock<std::sync::Arc<Vec<u8>>> = std::sync::OnceLock::new();
+    PNG.get_or_init(|| {
+        let (w, h) = (640u32, 400u32);
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+            let sun = ((fx - 0.62).powi(2) + ((fy - 0.42) * 1.6).powi(2)).sqrt();
+            let hill = 0.5 + 0.04 * (fx * 9.0).sin() + 0.03 * (fx * 23.0).cos();
+            let px = |r: f32, g: f32, b: f32| image::Rgb([r.min(255.0) as u8, g.min(255.0) as u8, b.min(255.0) as u8]);
+            if fy < 0.58 {
+                if sun < 0.07 {
+                    return px(255.0, 214.0, 140.0);
+                }
+                if fy > hill {
+                    return px(28.0, 40.0, 38.0);
+                }
+                let t = fy / 0.58;
+                let glow = (1.0 - sun * 2.5).max(0.0) * 70.0;
+                px(40.0 + 200.0 * t + glow, 50.0 + 90.0 * t + glow * 0.6, 120.0 + 30.0 * t)
+            } else {
+                let t = (fy - 0.58) / 0.42;
+                let streak = (fx - 0.62).abs() < 0.03 + 0.06 * t && (y / 5) % 2 == 0;
+                if streak {
+                    px(240.0, 170.0, 110.0)
+                } else {
+                    px(60.0 - 30.0 * t, 70.0 - 30.0 * t, 110.0 - 40.0 * t)
+                }
+            }
+        });
+        let mut out = Vec::new();
+        let _ = image::DynamicImage::ImageRgb8(img).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png);
+        std::sync::Arc::new(out)
+    })
+    .clone()
 }
 
 pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Event>) {

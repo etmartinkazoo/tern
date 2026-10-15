@@ -63,6 +63,18 @@ pub enum Action {
     Edit(Draft),
     Open(String),
     Mouse(bool),
+    Copy(String),
+}
+
+/// Text being selected with a mouse drag, held to the pane the drag started in.
+#[derive(Clone, Copy)]
+pub struct Sel {
+    pub area: Rect,
+    pub from: Position,
+    pub to: Position,
+    pub moved: bool,
+    /// The drag ended; copy what's highlighted on the next draw.
+    pub copy: bool,
 }
 
 /// Where things were drawn last frame, for mouse clicks.
@@ -77,6 +89,8 @@ pub struct Hits {
     pub settings_body: ratatui::layout::Rect,
     pub side_offset: usize,
     pub status: ratatui::layout::Rect,
+    /// (screen row, UID) of each message header in the conversation view.
+    pub conv_rows: Vec<(u16, u32)>,
 }
 
 pub struct AcctState {
@@ -198,9 +212,11 @@ pub struct App {
     /// Messages being shown as HTML instead of text, and the last HTML layout.
     pub html_view: HashSet<u32>,
     #[allow(clippy::type_complexity)]
-    pub html_cache: Option<((u32, u16, ratatui::style::Color), Vec<ratatui::text::Line<'static>>)>,
+    pub html_cache: Option<((u32, u16, ratatui::style::Color), Vec<crate::ui::Piece>)>,
+    pub images: crate::images::Images,
     /// For telling a double click from two single ones.
     last_click: Option<(Instant, u16, u16)>,
+    pub sel: Option<Sel>,
     /// Demo mode never talks to an SMTP server.
     pub demo: bool,
 }
@@ -276,7 +292,9 @@ impl App {
             hits: Hits::default(),
             html_view: HashSet::new(),
             html_cache: None,
+            images: crate::images::Images::new(),
             last_click: None,
+            sel: None,
             threads: vec![],
             rows: vec![],
             threaded: true,
@@ -817,6 +835,7 @@ impl App {
                     self.say(format!("{new} new"));
                 }
             }
+            Event::Image(id, img) => self.images.loaded(id, img),
             Event::Body { acct, folder, mut body } => {
                 let key = (acct, folder, body.uid);
                 // The list knows this message by its view id.
@@ -1132,6 +1151,7 @@ impl App {
     // ---------------------------------------------------------------- keys
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        self.sel = None;
         match &mut self.mode {
             Mode::Settings(_) => return self.settings_key(k),
             Mode::Outbox(_) => return self.outbox_key(k),
@@ -1366,6 +1386,7 @@ impl App {
                 self.mode = Mode::Prompt(Prompt { kind: PromptKind::Snooze, input: String::new(), sel: Some(0), completions });
             }
             KeyCode::Char('H') => self.toggle_html(),
+            KeyCode::Char('I') => self.load_remote_images(),
             KeyCode::Char('a') => self.answer_invite("ACCEPTED"),
             KeyCode::Char('t') => self.answer_invite("TENTATIVE"),
             KeyCode::Char('n') => self.answer_invite("DECLINED"),
@@ -1762,6 +1783,19 @@ impl App {
         });
     }
 
+    /// Remote pictures stay unloaded (they tell the sender you looked) until asked for.
+    fn load_remote_images(&mut self) {
+        let ids: Vec<String> = match self.conv_thread() {
+            Some(t) => t.members.iter().map(|&i| self.all[i].message_id.clone()).collect(),
+            None => self.body.iter().map(|b| b.message_id.clone()).collect(),
+        };
+        if ids.is_empty() {
+            return;
+        }
+        self.images.remote.extend(ids.iter().map(|m| m.trim_matches(['<', '>']).to_string()));
+        self.say("loading remote pictures");
+    }
+
     fn toggle_html(&mut self) {
         let Some(b) = &self.body else { return };
         if b.html.is_none() {
@@ -2140,6 +2174,8 @@ impl App {
         let inside = |r: Rect| r.contains(at);
         match m.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                // The highlight is on screen cells, so it would slide off its text.
+                self.sel = None;
                 let d: isize = if m.kind == MouseEventKind::ScrollDown { 3 } else { -3 };
                 self.wheel(at, d);
             }
@@ -2148,6 +2184,12 @@ impl App {
                     .last_click
                     .is_some_and(|(t, x, y)| t.elapsed() < Duration::from_millis(400) && x == m.column && y == m.row);
                 self.last_click = Some((Instant::now(), m.column, m.row));
+                let h = &self.hits;
+                let area = [h.side, h.list, h.body, h.settings_body]
+                    .into_iter()
+                    .find(|r| r.contains(at))
+                    .unwrap_or(Rect::new(0, 0, u16::MAX, u16::MAX));
+                self.sel = Some(Sel { area, from: at, to: at, moved: false, copy: false });
                 // The "? help" corner of the status bar.
                 if inside(self.hits.status) && m.column + 8 >= self.hits.status.x + self.hits.status.width {
                     return self.open_settings(settings::KEYS);
@@ -2159,6 +2201,29 @@ impl App {
                     _ => {}
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(s) = &mut self.sel {
+                    let a = s.area;
+                    s.to = Position {
+                        x: at.x.clamp(a.x, a.right().saturating_sub(1)),
+                        y: at.y.clamp(a.y, a.bottom().saturating_sub(1)),
+                    };
+                    s.moved |= s.to != s.from;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => match &mut self.sel {
+                Some(s) if s.moved => s.copy = true,
+                _ => {
+                    self.sel = None;
+                    // Clicking a message's header in a conversation opens or folds it. On
+                    // release, so a drag that starts on a header only selects.
+                    if matches!(self.mode, Mode::Normal) {
+                        if let Some(&(_, uid)) = self.hits.conv_rows.iter().find(|(y, _)| *y == at.y) {
+                            self.toggle_conv(uid);
+                        }
+                    }
+                }
+            },
             _ => {}
         }
     }
@@ -2220,6 +2285,18 @@ impl App {
             }
         } else if h.body.contains(at) && self.selected().is_some() {
             self.focus = Focus::Body;
+        }
+    }
+
+    fn toggle_conv(&mut self, uid: u32) {
+        if !self.conv_open.remove(&uid) {
+            self.conv_open.insert(uid);
+            // Long threads only prefetch their recent messages; fetch older ones on demand.
+            if self.cached(uid).is_none() {
+                for (a, f, real) in self.route(&[uid]) {
+                    self.send(a, Cmd::Bodies { folder: f, uids: real });
+                }
+            }
         }
     }
 

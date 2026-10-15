@@ -202,6 +202,9 @@ pub struct Ui {
     /// Click and scroll. Off gives the terminal back its own text selection.
     #[serde(default = "yes")]
     pub mouse: bool,
+    /// Draw pictures in messages (kitty, sixel or iTerm2 graphics; half blocks elsewhere).
+    #[serde(default = "yes")]
+    pub images: bool,
     /// Group the list into conversations.
     #[serde(default = "yes")]
     pub threads: bool,
@@ -390,7 +393,8 @@ list_percent = 40
 icons = true              # Nerd Font glyphs
 paint_background = false  # keep the terminal's (transparent) background
 mark_read_ms = 800        # dwell before a message counts as read; 0 = instantly
-mouse = true              # click/scroll; shift-drag still selects text in most terminals
+mouse = true              # click/scroll; drag to select and copy
+images = true             # pictures in messages; remote ones load with I
 threads = true            # group into conversations (T toggles)
 calendar_timezone = "America/New_York"   # or est, pst, Europe/Berlin, …
 collapse_threads = true   # one row per conversation (za / zR / zM)

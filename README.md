@@ -111,6 +111,7 @@ tern falls back to a built-in Tokyo Night.
 | `m` | new message |
 | `r` `R` `f` | reply / reply all / forward (forward carries attachments) |
 | `H` | show the message as HTML / as text |
+| `I` | load remote pictures in the message |
 | `o` | open the message in the browser (HTML, or the text if there's none) |
 | `L` `gx` | links in the message: type to filter, `⏎` opens, `^y` copies |
 | `S` | save attachments to `download_dir` |
@@ -311,13 +312,22 @@ laid out for the terminal: headings, bold and italics, links, lists, code and
 tables keep their shape. Colors from the email are left out so it stays readable
 on a dark theme. `o` still opens the real thing in your browser.
 
+## Pictures
+
+Pictures in a message are drawn where they sit in it, in both the text and the
+HTML view, using the kitty graphics protocol in kitty and Ghostty, sixel in foot
+and Konsole, and iTerm2's in iTerm2 and WezTerm. Other terminals get a rough
+half-block version. Pictures the message carries but never places go at the
+end. Remote pictures (`<img src="https://…">`) wait for `I`, since loading them
+tells the sender you opened the mail. **Pictures** in settings turns it off.
+
 ## Settings and mouse
 
 `,` opens settings, and `?` opens it at the Keys tab. The five tabs (`1`–`5` jump between them):
 
 - **General:** threads, folding, undo-send window, mark-read delay, time zone,
   today in the sidebar, notifications and reminder time, Zoom link and Meet
-  account, layout widths, icons, background, mouse, date format, download
+  account, layout widths, icons, background, mouse, pictures, date format, download
   folder and editor. Changes apply
   immediately and are saved to `config.toml`; your comments and layout there
   are kept.
@@ -333,9 +343,11 @@ Mouse:
 - Double-click a message (or a folded thread) to read it.
 - The wheel scrolls whichever pane it's over. Scrolling the list doesn't
   change which message is selected.
+- Click a message in a conversation to open or fold it.
+- Drag to select text; letting go copies it to the clipboard (OSC 52, plus
+  `wl-copy` or `xclip` for terminals that ignore that).
 - In settings, click a tab or a switch. Click a value twice to edit it.
-- Shift-drag still selects text in most terminals. Turn **Mouse** off in
-  settings for the terminal's plain selection.
+- Turn **Mouse** off in settings for the terminal's own selection.
 
 ## Threads
 

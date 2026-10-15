@@ -1,7 +1,11 @@
 //! Drawing. Dense by design: one line per message, no boxes, hairline separators, and
 //! color doing the work borders usually do.
 
-use crate::app::{App, Focus, Hits, Mode, PromptKind};
+use crate::app::{Action, App, Focus, Hits, Mode, PromptKind, Sel};
+use crate::images::Images;
+use crate::model::Event;
+use std::collections::HashSet;
+use tokio::sync::mpsc::UnboundedSender;
 use crate::settings::{self, GeneralRow};
 use crate::composer::{self, Composer, VMode};
 use crate::model::Role;
@@ -146,6 +150,51 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Prompt(p) if !p.completions.is_empty() => draw_completions(f, app, main, &t),
         _ => {}
     }
+    if let Some(s) = &mut app.sel {
+        let text = draw_selection(f.buffer_mut(), *s);
+        if s.copy && !text.is_empty() {
+            app.actions.push(Action::Copy(text));
+        }
+        s.copy = false;
+    }
+}
+
+/// Highlights a mouse selection, running line by line like a terminal's within its pane,
+/// and returns its text.
+fn draw_selection(buf: &mut ratatui::buffer::Buffer, s: Sel) -> String {
+    let (a, b) = if (s.from.y, s.from.x) <= (s.to.y, s.to.x) { (s.from, s.to) } else { (s.to, s.from) };
+    let area = s.area.intersection(buf.area);
+    let mut lines: Vec<String> = Vec::new();
+    for y in a.y.max(area.y)..=b.y.min(area.bottom().saturating_sub(1)) {
+        let x0 = if y == a.y { a.x } else { area.x };
+        let x1 = if y == b.y { b.x } else { area.right().saturating_sub(1) };
+        let mut line = String::new();
+        let mut skip = 0;
+        for x in x0.max(area.x)..=x1.min(area.right().saturating_sub(1)) {
+            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            // Pictures: escape sequences and kitty's placeholder characters, not text.
+            if cell.skip || cell.symbol().contains(['\x1b', '\u{10EEEE}']) {
+                continue;
+            }
+            // A wide character's second cell holds nothing of its own.
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            line.push_str(cell.symbol());
+            skip = cell.symbol().width().saturating_sub(1);
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    // Drop the pane's indent: the first line's own, and what the rest share.
+    let indent = lines.iter().skip(1).filter(|l| !l.is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+    let mut out = lines.first().map(|l| l.trim_start().to_string()).unwrap_or_default();
+    for l in lines.iter().skip(1) {
+        out.push('\n');
+        out.push_str(l.get(indent..).unwrap_or(""));
+    }
+    out.trim_end().to_string()
 }
 
 fn draw_sep(f: &mut Frame, r: Rect, t: &Theme) {
@@ -598,7 +647,7 @@ fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let text_w = w.saturating_sub(2);
     // Plain text by default; `H` swaps in the HTML part rendered with its styling.
     let as_html = app.html_view.contains(&b.uid) && b.html.is_some();
-    let body_lines: Vec<Line<'static>> = if as_html {
+    let pieces: Vec<Piece> = if as_html {
         let key = (b.uid, text_w as u16, t.accent);
         match &app.html_cache {
             Some((k, lines)) if *k == key => lines.clone(),
@@ -609,9 +658,11 @@ fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
             }
         }
     } else {
-        wrap(&classify(&b.text), text_w).iter().map(|(s, k)| styled_line(s, *k, t)).collect()
+        text_pieces(&b.text, text_w, "", t)
     };
     let avail = (r.height as usize).saturating_sub(head.len() + 1);
+    let laid = lay_out(pieces, b, &mut app.images, &app.events_tx, app.cfg.ui.images, "", text_w as u16, (avail as u16).saturating_sub(1).max(4), t);
+    let body_lines = laid.lines;
     app.body_height = avail + 2;
     app.body_lines = body_lines.len();
     let max = body_lines.len().saturating_sub(avail);
@@ -627,6 +678,10 @@ fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         (false, true) => " text · H html",
         _ => "",
     };
+    let tag = match laid.blocked {
+        0 => tag.to_string(),
+        n => format!(" {n} remote picture{} · I load ·{tag}", if n == 1 { "" } else { "s" }),
+    };
     let rule_w = w.saturating_sub(pct.width() + tag.width() + 4);
     head.push(Line::from(vec![
         Span::styled(format!(" {}", "─".repeat(rule_w)), Style::default().fg(mix(t.subtle, t.bg, 0.4))),
@@ -639,6 +694,7 @@ fn draw_body(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let body_area = Rect { y: r.y + head_h, height: r.height.saturating_sub(head_h), x: r.x + 1, width: r.width.saturating_sub(1) };
     let lines: Vec<Line> = body_lines.into_iter().skip(app.body_scroll).take(avail).collect();
     f.render_widget(Paragraph::new(lines), body_area);
+    draw_pics(f, &mut app.images, &laid.pics, app.body_scroll, Rect { height: body_area.height.min(avail as u16), ..body_area }, 0);
 }
 
 fn invite_card(inv: &crate::calendar::Invite, conflicts: &[String], me: &str, answered: Option<&str>, w: usize, t: &Theme) -> Vec<Line<'static>> {
@@ -711,19 +767,31 @@ fn invite_card(inv: &crate::calendar::Invite, conflicts: &[String], me: &str, an
 /// HTML laid out for the terminal: headings and bold, italics, links, code, lists and
 /// tables keep their shape. The email's own colors are left out on purpose: they are
 /// chosen for white backgrounds and turn unreadable on a dark theme.
-fn html_lines(html: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
+fn html_lines(html: &str, width: usize, t: &Theme) -> Vec<Piece> {
     use html2text::render::text_renderer::RichAnnotation as A;
     let width = width.max(20);
     // html2text panics on some malformed input; fall back to plain conversion.
     let rich = std::panic::catch_unwind(|| html2text::from_read_rich(html.as_bytes(), width));
     let Ok(rich) = rich else {
-        return crate::parse::html_to_text(html).lines().map(|l| Line::from(l.to_string())).collect();
+        return crate::parse::html_to_text(html).lines().map(|l| Piece::Line(Line::from(l.to_string()))).collect();
     };
-    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut out: Vec<Piece> = Vec::new();
     let mut blank = 0;
     for line in rich {
+        // Pictures come out as their alt text; they go below the line, the alt text kept
+        // for when they can't be drawn.
+        let mut pics: Vec<(String, Vec<Span<'static>>)> = Vec::new();
         let spans: Vec<Span<'static>> = line
             .tagged_strings()
+            .filter(|ts| {
+                let Some(src) = ts.tag.iter().find_map(|a| if let A::Image(s) = a { Some(s.clone()) } else { None }) else { return true };
+                let alt = Span::styled(ts.s.clone(), Style::default().fg(t.magenta).add_modifier(Modifier::ITALIC));
+                match pics.last_mut() {
+                    Some((last, alts)) if *last == src => alts.push(alt),
+                    _ => pics.push((src, vec![alt])),
+                }
+                false
+            })
             .map(|ts| {
                 let mut st = Style::default().fg(t.fg);
                 for a in &ts.tag {
@@ -742,16 +810,174 @@ fn html_lines(html: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
             .collect();
         // Marketing mail stacks empty spacer rows; keep at most one.
         let empty = spans.iter().all(|s| s.content.trim().is_empty());
-        blank = if empty { blank + 1 } else { 0 };
-        if blank > 1 {
+        blank = if empty && pics.is_empty() { blank + 1 } else { 0 };
+        if blank > 1 || (empty && !pics.is_empty()) {
+            out.extend(pics.into_iter().map(|(src, alt)| Piece::Pic(src, Line::from(alt))));
             continue;
         }
-        out.push(Line::from(spans));
+        out.push(Piece::Line(Line::from(spans)));
+        out.extend(pics.into_iter().map(|(src, alt)| Piece::Pic(src, Line::from(alt))));
     }
-    while out.first().is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty())) {
+    while out.first().is_some_and(|p| matches!(p, Piece::Line(l) if l.spans.iter().all(|s| s.content.trim().is_empty()))) {
         out.remove(0);
     }
     out
+}
+
+/// A message body before pictures are sized: lines, and pictures by reference.
+#[derive(Clone)]
+pub enum Piece {
+    Line(Line<'static>),
+    /// A picture (`cid:…`, a URL, a data URI or a file name), and what to show instead
+    /// when it can't be drawn.
+    Pic(String, Line<'static>),
+}
+
+/// Plain text, with a line that is only a picture reference (`[cid:…]` from Outlook,
+/// `[image: …]` from Gmail) made into the picture.
+fn text_pieces(text: &str, width: usize, indent: &str, t: &Theme) -> Vec<Piece> {
+    fn flush(chunk: &mut String, out: &mut Vec<Piece>, width: usize, indent: &str, t: &Theme) {
+        for (s, k) in wrap(&classify(chunk), width) {
+            let mut l = styled_line(&s, k, t);
+            if !indent.is_empty() {
+                l.spans.insert(0, Span::raw(indent.to_string()));
+            }
+            out.push(Piece::Line(l));
+        }
+        chunk.clear();
+    }
+    let mut out = Vec::new();
+    let mut chunk = String::new();
+    for line in text.lines() {
+        let inner = line.trim().strip_prefix('[').and_then(|l| l.strip_suffix(']'));
+        let pic = inner.and_then(|i| i.strip_prefix("cid:").map(|c| format!("cid:{c}")).or_else(|| i.strip_prefix("image:").map(|n| n.trim().to_string())));
+        match pic {
+            Some(r) => {
+                flush(&mut chunk, &mut out, width, indent, t);
+                out.push(Piece::Pic(r, Line::from(Span::styled(line.trim().to_string(), Style::default().fg(t.subtle)))));
+            }
+            None => {
+                chunk.push_str(line);
+                chunk.push('\n');
+            }
+        }
+    }
+    flush(&mut chunk, &mut out, width, indent, t);
+    out
+}
+
+/// A picture laid out among a message's lines: `rows` blank lines from `line` on.
+#[derive(Clone, Copy)]
+struct Pic {
+    line: usize,
+    id: u64,
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Default)]
+struct Laid {
+    lines: Vec<Line<'static>>,
+    pics: Vec<Pic>,
+    /// Remote pictures not loaded, waiting for I.
+    blocked: usize,
+}
+
+/// Turns pieces into lines, making room for each picture at most `cols` × `rows` cells.
+/// Pictures the message carries but never references go at the end.
+#[allow(clippy::too_many_arguments)]
+fn lay_out(pieces: Vec<Piece>, b: &crate::model::Body, im: &mut Images, tx: &UnboundedSender<Event>, show: bool, indent: &str, cols: u16, rows: u16, t: &Theme) -> Laid {
+    use crate::images::{data_uri, hash, Source, State};
+    let alt = |out: &mut Laid, mut l: Line<'static>| {
+        if l.spans.iter().any(|s| !s.content.trim().is_empty()) {
+            l.spans.insert(0, Span::raw(indent.to_string()));
+            out.lines.push(l);
+        }
+    };
+    let place = |out: &mut Laid, im: &mut Images, id: u64, src: Box<dyn FnOnce() -> Option<Source> + '_>| {
+        im.want(id, src, tx);
+        let note = |s: &str| Line::from(Span::styled(format!("{indent}▣ {s}"), Style::default().fg(t.subtle)));
+        match im.state(id, cols, rows) {
+            State::Loading => out.lines.push(note("loading picture…")),
+            State::Hidden => {}
+            State::Failed => out.lines.push(note("picture can't be shown")),
+            State::Ready { cols, rows } => {
+                out.pics.push(Pic { line: out.lines.len(), id, cols, rows });
+                out.lines.extend((0..=rows).map(|_| Line::from("")));
+            }
+        }
+    };
+    let remote = im.remote.contains(b.message_id.trim_matches(['<', '>']));
+    let mut out = Laid::default();
+    let mut seen = HashSet::new();
+    for p in pieces {
+        let (r, fallback) = match p {
+            Piece::Line(l) => {
+                out.lines.push(l);
+                continue;
+            }
+            Piece::Pic(r, fallback) => (r, fallback),
+        };
+        if !show || out.pics.len() >= 40 {
+            alt(&mut out, fallback);
+            continue;
+        }
+        let part = match r.strip_prefix("cid:") {
+            Some(c) => b.images.iter().find(|i| i.cid == c.trim_matches(['<', '>'])),
+            None => b.images.iter().find(|i| !i.name.is_empty() && i.name.eq_ignore_ascii_case(&r)),
+        };
+        if let Some(i) = part {
+            seen.insert(i.id);
+            let d = i.data.clone();
+            place(&mut out, im, i.id, Box::new(move || Some(Source::Bytes(d))));
+        } else if r.starts_with("data:") {
+            place(&mut out, im, hash(&r), Box::new(|| data_uri(&r).map(|v| Source::Bytes(std::sync::Arc::new(v)))));
+        } else if r.starts_with("https://") || r.starts_with("http://") {
+            if remote {
+                place(&mut out, im, hash(&r), Box::new(|| Some(Source::Url(r.clone()))));
+            } else {
+                out.blocked += 1;
+                alt(&mut out, fallback);
+            }
+        } else {
+            alt(&mut out, fallback);
+        }
+    }
+    if show {
+        let html = b.html.as_deref().unwrap_or("");
+        let referenced = |i: &crate::model::Img| {
+            (!i.cid.is_empty() && (b.text.contains(&i.cid) || html.contains(&i.cid)))
+                || (!i.name.is_empty() && b.text.contains(&format!("[image: {}]", i.name)))
+        };
+        let rest: Vec<_> = b.images.iter().filter(|i| !seen.contains(&i.id) && !referenced(i)).collect();
+        if !rest.is_empty() && out.lines.last().is_some_and(|l| !l.spans.iter().all(|s| s.content.trim().is_empty())) {
+            out.lines.push(Line::from(""));
+        }
+        for i in rest.into_iter().take(40) {
+            let d = i.data.clone();
+            place(&mut out, im, i.id, Box::new(move || Some(Source::Bytes(d))));
+        }
+    }
+    out
+}
+
+/// Draws the pictures that are at least partly in view, `scroll` lines down the body.
+fn draw_pics(f: &mut Frame, im: &mut Images, pics: &[Pic], scroll: usize, area: Rect, indent: u16) {
+    let avail = area.height as usize;
+    for p in pics {
+        let top = p.line.max(scroll);
+        let bot = (p.line + p.rows as usize).min(scroll + avail);
+        if top >= bot {
+            continue;
+        }
+        let rect = Rect {
+            x: area.x + indent,
+            y: area.y + (top - scroll) as u16,
+            width: p.cols.min(area.width.saturating_sub(indent)),
+            height: (bot - top) as u16,
+        };
+        im.render(f, p.id, (p.cols, p.rows), (top - p.line) as u16, rect);
+    }
 }
 
 /// A folded conversation, oldest first: unread messages and the latest open, the rest one
@@ -778,7 +1004,11 @@ fn draw_conversation(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let text_w = w.saturating_sub(3);
     let rule = Style::default().fg(mix(t.subtle, t.bg, 0.55));
     let mut body: Vec<Line> = Vec::new();
+    let mut pics: Vec<Pic> = Vec::new();
+    let mut blocked = 0;
+    let pic_rows = ((r.height as usize).saturating_sub(head.len() + 1) as u16).saturating_sub(1).max(4);
     let mut anchor = None;
+    let mut headers: Vec<(usize, u32)> = Vec::new();
     for (k, &i) in th.chrono.iter().enumerate() {
         let e = app.all[i].clone();
         let open = app.conv_open.contains(&e.uid);
@@ -792,6 +1022,7 @@ fn draw_conversation(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         let mine = !me.is_empty() && e.from_addr.eq_ignore_ascii_case(&me);
         let name = if mine { "me".to_string() } else { e.sender().to_string() };
         let date = short_date(e.date, &fmt);
+        headers.push((body.len(), e.uid));
         let dot = if !e.seen { Span::styled("● ", Style::default().fg(t.accent)) } else { Span::raw("  ") };
         let name_st = if open {
             Style::default().fg(if mine { t.green } else { t.fg }).add_modifier(Modifier::BOLD)
@@ -840,11 +1071,11 @@ fn draw_conversation(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
                 }
                 body.push(Line::from(""));
                 let (text, hidden) = crate::thread::strip_quoted(&b.text);
-                for (s, k) in wrap(&classify(&text), text_w) {
-                    let mut l = styled_line(&s, k, t);
-                    l.spans.insert(0, Span::raw("   "));
-                    body.push(l);
-                }
+                let pieces = text_pieces(&text, text_w, "   ", t);
+                let laid = lay_out(pieces, &b, &mut app.images, &app.events_tx, app.cfg.ui.images, "   ", text_w as u16, pic_rows, t);
+                pics.extend(laid.pics.iter().map(|p| Pic { line: p.line + body.len(), ..*p }));
+                blocked += laid.blocked;
+                body.extend(laid.lines);
                 if hidden {
                     body.push(Line::from(Span::styled("   ··· quoted text hidden", Style::default().fg(t.subtle))));
                 }
@@ -868,15 +1099,26 @@ fn draw_conversation(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     } else {
         format!("{}%", (app.body_scroll + avail).min(body.len()) * 100 / body.len().max(1))
     };
+    let tag = match blocked {
+        0 => String::new(),
+        n => format!(" {n} remote picture{} · I load", if n == 1 { "" } else { "s" }),
+    };
     head.push(Line::from(vec![
-        Span::styled(format!(" {}", "─".repeat(w.saturating_sub(pct.width() + 3))), Style::default().fg(mix(t.subtle, t.bg, 0.4))),
+        Span::styled(format!(" {}", "─".repeat(w.saturating_sub(pct.width() + tag.width() + 3))), Style::default().fg(mix(t.subtle, t.bg, 0.4))),
+        Span::styled(tag, Style::default().fg(t.subtle)),
         Span::styled(format!(" {pct}"), Style::default().fg(t.subtle)),
     ]));
     let head_h = head.len() as u16;
     f.render_widget(Paragraph::new(head), Rect { height: head_h.min(r.height), ..r });
     let area = Rect { y: r.y + head_h, height: r.height.saturating_sub(head_h), ..r };
+    app.hits.conv_rows = headers
+        .into_iter()
+        .filter(|&(l, _)| l >= app.body_scroll && l < app.body_scroll + avail)
+        .map(|(l, uid)| (area.y + (l - app.body_scroll) as u16, uid))
+        .collect();
     let lines: Vec<Line> = body.into_iter().skip(app.body_scroll).take(avail).collect();
     f.render_widget(Paragraph::new(lines), area);
+    draw_pics(f, &mut app.images, &pics, app.body_scroll, Rect { height: area.height.min(avail as u16), ..area }, 3);
 }
 
 /// The composer body, soft-wrapped to the pane. Wrapping is display only; the text keeps
@@ -2204,4 +2446,33 @@ fn scroll_render(f: &mut Frame, app: &mut App, r: Rect, lines: Vec<Line>) {
     st.scroll = st.scroll.min(lines.len().saturating_sub(r.height as usize));
     let skip = st.scroll;
     f.render_widget(Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()), r);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pics(p: &[Piece]) -> Vec<String> {
+        p.iter().filter_map(|p| if let Piece::Pic(r, _) = p { Some(r.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn finds_pictures_in_html() {
+        let t = Theme::fallback();
+        let p = html_lines(r#"<p>See the chart:</p><img src="cid:chart@x" alt="Q3 chart"><p>Thanks</p>"#, 60, &t);
+        assert_eq!(pics(&p), ["cid:chart@x"]);
+        let text: Vec<String> = p
+            .iter()
+            .filter_map(|p| if let Piece::Line(l) = p { Some(l.spans.iter().map(|s| s.content.to_string()).collect()) } else { None })
+            .collect();
+        assert!(text.iter().any(|l| l.contains("See the chart")));
+        assert!(text.iter().all(|l| !l.contains("Q3 chart")), "alt text is the fallback, not a line");
+    }
+
+    #[test]
+    fn finds_pictures_in_text() {
+        let t = Theme::fallback();
+        let p = text_pieces("Hi Ted,\n\n[cid:image001.png@01DB]\n\nSee above.\n[image: shot.png]\n> [cid:quoted]", 60, "", &t);
+        assert_eq!(pics(&p), ["cid:image001.png@01DB", "shot.png"]);
+    }
 }
