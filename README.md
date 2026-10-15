@@ -49,7 +49,8 @@ The script installs a C compiler, git and the helper tools tern calls
 (`notify-send`, `wl-copy`, `xdg-open`) with `apt` or `dnf`, using `sudo` when
 you aren't root. If there's no Rust 1.89 or newer on your `PATH` (Ubuntu's own
 is too old), it installs one with rustup into `~/.cargo`. Then it builds tern
-and puts it in `~/.cargo/bin`. Set `TERN_REF=<tag or branch>` to build
+and puts it in `~/.cargo/bin`. If that isn't on your `PATH` but `~/.local/bin`
+is, it links `tern` there; otherwise it tells you what to add. Set `TERN_REF=<tag or branch>` to build
 something other than `main`, or `TERN_NO_EXTRAS=1` to skip the helper tools.
 Run it again to update.
 

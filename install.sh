@@ -102,6 +102,9 @@ ensure_rust() {
 main() {
     [ "$(uname -s)" = Linux ] || die "this installer is for Linux."
 
+    # ensure_rust puts ~/.cargo/bin on our PATH, so remember the user's.
+    user_path=$PATH
+
     distro=$(detect_distro)
     install_packages "$distro"
     ensure_rust
@@ -120,13 +123,18 @@ main() {
 
     say "Installed $("$bin" --version 2>/dev/null || echo tern) to $bin"
 
-    case ":$PATH:" in
-        *":$(dirname "$bin"):"*) ;;
-        *)
-            warn "$(dirname "$bin") isn't on your PATH. Add this to your shell's startup file:"
-            echo "    export PATH=\"\$HOME/.cargo/bin:\$PATH\""
-            ;;
-    esac
+    on_path() { case ":$user_path:" in *":$1:"*) return 0 ;; esac; return 1; }
+    bindir=$(dirname "$bin")
+    if ! on_path "$bindir" && ! on_path "${bindir%/}/"; then
+        if on_path "$HOME/.local/bin"; then
+            mkdir -p "$HOME/.local/bin"
+            ln -sf "$bin" "$HOME/.local/bin/tern"
+            say "Linked $HOME/.local/bin/tern -> $bin"
+        else
+            warn "$bindir isn't on your PATH. Add this to your shell's startup file (~/.bashrc, ~/.zshrc):"
+            echo "    export PATH=\"$bindir:\$PATH\""
+        fi
+    fi
 
     cat <<EOF
 
