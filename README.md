@@ -37,10 +37,31 @@ The protocol work is done by [Pimalaya](https://github.com/pimalaya)'s libraries
 `ical-rs` (iCalendar, recurrence, time zones) and `io-oauth` (sign-in). tern
 itself is the interface.
 
+## Install
+
+On Debian, Ubuntu or Fedora:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/etmartinkazoo/tern/main/install.sh | sh
+```
+
+The script installs a C compiler, git and the helper tools tern calls
+(`notify-send`, `wl-copy`, `xdg-open`) with `apt` or `dnf`, using `sudo` when
+you aren't root. If there's no Rust 1.89 or newer on your `PATH` (Ubuntu's own
+is too old), it installs one with rustup into `~/.cargo`. Then it builds tern
+and puts it in `~/.cargo/bin`. Set `TERN_REF=<tag or branch>` to build
+something other than `main`, or `TERN_NO_EXTRAS=1` to skip the helper tools.
+Run it again to update.
+
+Anywhere else, with Rust 1.89+ and a C compiler:
+
+```sh
+cargo install --locked --git https://github.com/etmartinkazoo/tern   # or, in a checkout: cargo install --path .
+```
+
 ## Run it
 
 ```sh
-cargo install --git https://github.com/etmartinkazoo/tern   # or, in a checkout: cargo install --path .
 tern --demo                # look around with a fake mailbox
 tern --init                # writes ~/.config/tern/config.toml
 tern doctor                # check every account and server
