@@ -310,7 +310,10 @@ fn draw_list(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
     let icons = Icons { on: app.cfg.ui.icons };
     let focused = app.focus == Focus::List;
     let w = r.width as usize;
-    app.list_height = r.height.saturating_sub(1) as usize;
+    // Three lines a message (who and when, subject, preview) and a blank one between.
+    let tall = !app.cfg.ui.compact_list;
+    app.list_row_h = if tall { 4 } else { 1 };
+    app.list_height = if tall { (r.height as usize / 4).max(1) } else { r.height.saturating_sub(1) as usize };
 
     let folder = if app.unified() {
         "All inboxes".to_string()
@@ -400,6 +403,10 @@ fn draw_list(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
             _ if outgoing => format!("→ {}", e.recipient()),
             _ => e.sender().to_string(),
         };
+        if tall {
+            lines.extend(tall_entry(app, rw, th, w, sel, focused, marked, unread, flagged, attach, &who, &fmt, &icons, t));
+            continue;
+        }
         // Subject column: count badge for folded threads, tree glyphs for unfolded ones.
         let mut subj_spans: Vec<Span> = Vec::new();
         let mut used = 0;
@@ -456,6 +463,161 @@ fn draw_list(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         lines.push(line);
     }
     f.render_widget(Paragraph::new(lines), r);
+}
+
+/// One message in the three-line list: who and when, what (with its markers), and the
+/// first words, then a faint rule. Every line starts at the same column; the unread
+/// dot sits in a gutter to its left.
+#[allow(clippy::too_many_arguments)]
+fn tall_entry(
+    app: &App,
+    rw: &crate::thread::Row,
+    th: Option<&crate::thread::Thread>,
+    w: usize,
+    sel: bool,
+    focused: bool,
+    marked: bool,
+    unread: bool,
+    flagged: bool,
+    attach: bool,
+    who: &str,
+    fmt: &str,
+    icons: &Icons,
+    t: &Theme,
+) -> Vec<Line<'static>> {
+    let e = &app.all[rw.msg];
+    let bg = if sel {
+        Some(if focused { t.sel_bg } else { mix(t.sel_bg, t.bg, 0.5) })
+    } else if marked {
+        Some(mix(t.bg, t.magenta, 0.10))
+    } else {
+        None
+    };
+    // On the selection the quiet colours step up so nothing sinks into the highlight.
+    let quiet = if sel { t.muted } else { t.subtle };
+    let faint = if sel { t.muted } else { mix(t.subtle, t.bg, 0.25) };
+
+    // An open conversation's replies keep their tree glyph, continued down the entry.
+    let (tree, cont) = match (rw.kind, th) {
+        (RowKind::Child, Some(th)) => {
+            let g = format!("{} ", th.trees[rw.member]);
+            let c: String = g.chars().map(|c| if c == '├' || c == '│' { '│' } else { ' ' }).collect();
+            (g, c)
+        }
+        _ => (String::new(), String::new()),
+    };
+    let tree_st = Style::default().fg(faint);
+    // mark │ status │ space, then the text column; one column free on the right.
+    let gutter = 3 + tree.width();
+    let text_w = w.saturating_sub(gutter + 1);
+
+    let mark = Span::styled(if marked { "▌" } else { " " }, Style::default().fg(t.magenta));
+    let (status, status_c) = if unread {
+        ("●", t.accent)
+    } else if e.answered {
+        (icons.replied(), quiet)
+    } else {
+        (" ", quiet)
+    };
+    let lead = |first: bool| -> Vec<Span<'static>> {
+        if first {
+            vec![mark.clone(), Span::styled(tree.clone(), tree_st), Span::styled(status, Style::default().fg(status_c)), Span::raw(" ")]
+        } else {
+            vec![mark.clone(), Span::styled(cont.clone(), tree_st), Span::raw("  ")]
+        }
+    };
+    // Left text and right-aligned extras sharing one line of `text_w`.
+    let row = |first: bool, left: Vec<Span<'static>>, right: Vec<Span<'static>>| -> Line<'static> {
+        let right_w: usize = right.iter().map(|s| s.content.width()).sum();
+        let room = text_w.saturating_sub(right_w + if right_w > 0 { 2 } else { 0 });
+        let mut spans = lead(first);
+        let mut used = 0;
+        for sp in left {
+            let c = fit(&sp.content, room.saturating_sub(used));
+            used += c.width();
+            spans.push(Span::styled(c, sp.style));
+            if used >= room {
+                break;
+            }
+        }
+        spans.push(Span::raw(" ".repeat(text_w.saturating_sub(used + right_w))));
+        spans.extend(right);
+        spans.push(Span::raw(" "));
+        let mut l = Line::from(spans);
+        if let Some(bg) = bg {
+            l = l.style(Style::default().bg(bg));
+        }
+        l
+    };
+
+    // 1: who and when, with the account in the unified inbox.
+    let who_st = if unread { Style::default().fg(t.fg).add_modifier(Modifier::BOLD) } else { Style::default().fg(t.fg) };
+    let mut when = Vec::new();
+    if app.unified() {
+        let name = app.accts.get(e.acct).map(|a| a.cfg.name.as_str()).unwrap_or("?");
+        let col = [t.blue, t.magenta, t.green, t.yellow, t.cyan, t.red][e.acct % 6];
+        when.push(Span::styled(name.chars().take(3).collect::<String>(), Style::default().fg(col)));
+        when.push(Span::raw("  "));
+    }
+    when.push(Span::styled(short_date(e.date, fmt), Style::default().fg(if unread { t.accent } else { quiet })));
+
+    // 2: what, with its markers on the right.
+    let subj_st = if unread { Style::default().fg(t.fg).add_modifier(Modifier::BOLD) } else { Style::default().fg(if sel { t.fg } else { t.muted }) };
+    let (subject, count) = match (rw.kind, th) {
+        (RowKind::Collapsed, Some(th)) => (Some(app.all[th.members[0]].subject.clone()), th.members.len()),
+        (RowKind::Head, Some(th)) => (Some(e.subject.clone()), th.members.len()),
+        // A reply shows its subject only when it changed from the conversation's.
+        (RowKind::Child, Some(th)) => {
+            let root = &app.all[th.members[0]];
+            let same = crate::thread::normalize_subject(&e.subject).0 == crate::thread::normalize_subject(&root.subject).0;
+            ((!same).then(|| e.subject.clone()), 0)
+        }
+        _ => (Some(e.subject.clone()), 0),
+    };
+    let mut marks = Vec::new();
+    if flagged {
+        marks.push(Span::styled(icons.flag(), Style::default().fg(t.yellow)));
+    }
+    if attach {
+        marks.push(Span::styled(icons.clip(), Style::default().fg(quiet)));
+    }
+    if count > 1 {
+        if !marks.is_empty() {
+            marks.push(Span::raw(" "));
+        }
+        let open = if rw.kind == RowKind::Head { "▾" } else { "›" };
+        marks.push(Span::styled(format!("{count} {open}"), Style::default().fg(if unread { t.accent } else { quiet })));
+    }
+
+    // 3: the opening words, from the list fetch or else a body already loaded.
+    let mut preview = e.preview.clone();
+    if preview.is_empty() {
+        if let Some(b) = app.cached(e.uid) {
+            preview = crate::parse::preview_of(&crate::thread::strip_quoted(&b.text).0);
+        }
+    }
+    let preview_st = Style::default().fg(quiet);
+    let text = |s: String, st: Style| vec![Span::styled(s, st)];
+
+    let mut out = vec![row(true, text(who.to_string(), who_st), when)];
+    match subject {
+        Some(s) => {
+            out.push(row(false, text(s, subj_st), marks));
+            out.push(row(false, text(preview, preview_st), vec![]));
+        }
+        // No subject to repeat: the preview gets both lines.
+        None => {
+            let wrapped: Vec<String> = textwrap::wrap(&preview, text_w.saturating_sub(2 + marks.iter().map(|s| s.content.width()).sum::<usize>()).max(1)).into_iter().map(|l| l.into_owned()).collect();
+            let first = wrapped.first().cloned().unwrap_or_default();
+            let rest = wrapped.get(1..).map(|r| r.join(" ")).unwrap_or_default();
+            out.push(row(false, text(first, preview_st), marks));
+            out.push(row(false, text(rest, preview_st), vec![]));
+        }
+    }
+    // A hairline under the entry, inset to the text column like a list in a Mac app.
+    let rule_st = Style::default().fg(mix(t.bg, t.subtle, 0.22));
+    out.push(Line::from(vec![Span::raw(" ".repeat(gutter)), Span::styled("─".repeat(text_w), rule_st)]));
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -1351,6 +1513,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
             PromptKind::Move => ("MOVE", t.magenta),
             PromptKind::Attach => ("ATTACH", t.yellow),
             PromptKind::Link => ("LINK", t.cyan),
+            PromptKind::Plugin | PromptKind::PluginField => ("PLUGIN", t.blue),
         },
         Mode::Settings(_) => ("SETTINGS", t.cyan),
         Mode::Outbox(_) => ("OUTBOX", t.yellow),
@@ -1373,6 +1536,7 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
         }
     }
     if let Mode::Prompt(p) = &app.mode {
+        let field_label = format!(" {}:", app.plugin_field_label());
         let label = match p.kind {
             PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter => " /",
             PromptKind::QuickAdd => " add:",
@@ -1381,6 +1545,8 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
             PromptKind::Move => " move to:",
             PromptKind::Attach => " file:",
             PromptKind::Link => " link:",
+            PromptKind::Plugin => " :",
+            PromptKind::PluginField => field_label.as_str(),
         };
         spans.push(Span::styled(label, Style::default().fg(t.muted)));
         spans.push(Span::styled(format!(" {}", p.input), Style::default().fg(t.fg)));
@@ -1394,6 +1560,8 @@ fn draw_status(f: &mut Frame, app: &App, r: Rect, t: &Theme) {
             PromptKind::ConfirmDelete => "  y deletes · anything else keeps it",
             PromptKind::Move | PromptKind::Attach => "  tab: complete · ↑↓ pick · enter: ok",
             PromptKind::Link => "  type to filter · ↑↓ pick · enter: open in browser · ^y: copy",
+            PromptKind::Plugin => "  type to filter · ↑↓ pick · enter: run",
+            PromptKind::PluginField => "  enter: next · esc: cancel",
         };
         spans.push(Span::styled(hint, Style::default().fg(t.subtle)));
         f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(t.surface)), r);
@@ -2390,7 +2558,7 @@ fn draw_settings_theme(f: &mut Frame, app: &mut App, r: Rect, t: &Theme) {
         Line::from(""),
         Line::from(vec![
             Span::styled(t.name.clone(), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("  follows omarchy-theme-set live", Style::default().fg(t.subtle)),
+            Span::styled("  follows fedcandor-theme / omarchy-theme-set live", Style::default().fg(t.subtle)),
         ]),
         kv("From", dir, t),
         Line::from(""),

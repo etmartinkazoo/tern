@@ -289,6 +289,21 @@ async fn account(o: &mut Out, a: &Account) {
 }
 
 fn local(o: &mut Out, cfg: &Config) {
+    // Plugins.
+    let (plugins, errors) = crate::plugins::load();
+    for p in &plugins {
+        let actions: Vec<String> = p
+            .actions
+            .iter()
+            .map(|a| a.key_char().map(|k| format!("{} (;{k})", a.title)).unwrap_or_else(|| a.title.clone()))
+            .collect();
+        let what = if p.description.is_empty() { actions.join(", ") } else { format!("{} — {}", p.description, actions.join(", ")) };
+        o.ok("plugin", &format!("{}: {what}", p.name));
+    }
+    for e in &errors {
+        o.warn("plugin", e, Some("fix its plugin.toml (see the Plugins section of the README)"));
+    }
+
     // Theme.
     let dir = cfg.ui.theme_dir.clone().map(|p| crate::theme::expand(&p.to_string_lossy())).or_else(crate::theme::default_dir);
     match dir {
@@ -301,7 +316,7 @@ fn local(o: &mut Out, cfg: &Config) {
             }
         }
         Some(d) => o.warn("theme", &format!("{} doesn't exist; using the built-in colors", d.display()), None),
-        None => o.ok("theme", "built-in colors (no Omarchy theme found)"),
+        None => o.ok("theme", "built-in colors (no fedcandor or Omarchy theme found)"),
     }
     // Time zone.
     match crate::calendar::parse_zone(&cfg.ui.calendar_timezone) {

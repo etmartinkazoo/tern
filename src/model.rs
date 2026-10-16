@@ -44,6 +44,8 @@ pub struct Envelope {
     pub acct: usize,
     pub in_reply_to: String,
     pub references: Vec<String>,
+    /// The opening words of the body, for the list's third line.
+    pub preview: String,
 }
 
 impl Envelope {

@@ -251,6 +251,8 @@ fn header_items() -> Vec<MessageDataItemName<'static>> {
         MessageDataItemName::InternalDate,
         MessageDataItemName::Rfc822Size,
         MessageDataItemName::BodyExt { section: Some(Section::Header(None)), partial: None, peek: true },
+        // Enough of the body for a line of preview in the list.
+        MessageDataItemName::BodyExt { section: Some(Section::Text(None)), partial: Some((0, std::num::NonZeroU32::new(parse::PREVIEW_BYTES).unwrap())), peek: true },
     ]
 }
 
@@ -263,12 +265,18 @@ fn to_envelope(items: &[MessageDataItem<'static>]) -> Option<Envelope> {
     let mut uid = None;
     let mut flags = Vec::new();
     let mut header: Vec<u8> = Vec::new();
+    let mut text: Vec<u8> = Vec::new();
     let mut internal = None;
     for it in items {
         match it {
             MessageDataItem::Uid(u) => uid = Some(u.get()),
             MessageDataItem::Flags(f) => flags = f.iter().map(flag_str).collect(),
             MessageDataItem::InternalDate(d) => internal = Some(d.as_ref().with_timezone(&Local)),
+            MessageDataItem::BodyExt { section: Some(Section::Text(None)), data, .. } => {
+                if let Some(b) = data.clone().into_option() {
+                    text = b.into_owned();
+                }
+            }
             MessageDataItem::BodyExt { data, .. } | MessageDataItem::Rfc822Header(data) => {
                 if let Some(b) = data.clone().into_option() {
                     header = b.into_owned();
@@ -277,7 +285,9 @@ fn to_envelope(items: &[MessageDataItem<'static>]) -> Option<Envelope> {
             _ => {}
         }
     }
-    Some(parse::envelope(uid?, &header, &flags, internal))
+    let mut env = parse::envelope(uid?, &header, &flags, internal);
+    env.preview = parse::preview(&header, &text);
+    Some(env)
 }
 
 fn to_raw(items: &[MessageDataItem<'static>]) -> Option<(u32, Vec<u8>)> {

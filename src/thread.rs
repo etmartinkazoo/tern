@@ -287,6 +287,7 @@ mod tests {
             acct: 0,
             in_reply_to: reply_to.into(),
             references: if reply_to.is_empty() { vec![] } else { vec![reply_to.into()] },
+            preview: String::new(),
         }
     }
 

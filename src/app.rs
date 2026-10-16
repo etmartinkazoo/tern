@@ -36,6 +36,10 @@ pub enum PromptKind {
     Attach,
     /// Pick one of the message's links to open or copy.
     Link,
+    /// Pick a plugin action (`:`).
+    Plugin,
+    /// Fill in one of a plugin action's fields before it runs.
+    PluginField,
 }
 
 #[derive(Debug)]
@@ -44,6 +48,27 @@ pub struct Prompt {
     pub input: String,
     pub completions: Vec<String>,
     pub sel: Option<usize>,
+}
+
+/// A plugin action whose fields are being filled in.
+struct PluginForm {
+    plugin: usize,
+    action: usize,
+    field: usize,
+    values: Vec<(String, String)>,
+    vars: Vec<(&'static str, String)>,
+    acct: usize,
+    messages: Vec<serde_json::Value>,
+    uids: Vec<u32>,
+    files: Option<std::path::PathBuf>,
+}
+
+/// A plugin action running in the background.
+struct PluginRun {
+    name: String,
+    /// The list it was started from and the messages it acts on (for `then`).
+    current: Option<(usize, String)>,
+    uids: Vec<u32>,
 }
 
 pub enum Mode {
@@ -137,7 +162,10 @@ pub struct App {
     pub view: Vec<usize>,
     pub cursor: usize,
     pub list_offset: usize,
+    /// How many messages fit in the list, not screen lines.
     pub list_height: usize,
+    /// Screen lines each message takes in the list, its gap included.
+    pub list_row_h: usize,
     pub marked: HashSet<u32>,
     pub filter: String,
 
@@ -161,6 +189,13 @@ pub struct App {
     last_poll: Instant,
     last_theme_check: Instant,
     pub actions: Vec<Action>,
+    /// Plugins (`~/.config/tern/plugins`), what's being filled in, and what's running.
+    plugins: Vec<crate::plugins::Plugin>,
+    plugin_choices: Vec<(usize, usize, String)>,
+    plugin_form: Option<PluginForm>,
+    plugin_inbox: crate::plugins::Inbox,
+    plugin_runs: HashMap<u64, PluginRun>,
+    plugin_next: u64,
     /// A draft set aside while the attach prompt is open.
     parked: Option<Box<Composer>>,
     /// UIDs the server matched for the current filter (body text included).
@@ -246,6 +281,7 @@ impl App {
             cursor: 0,
             list_offset: 0,
             list_height: 20,
+            list_row_h: 1,
             marked: HashSet::new(),
             filter: String::new(),
             body: None,
@@ -266,6 +302,12 @@ impl App {
             last_poll: Instant::now(),
             last_theme_check: Instant::now(),
             actions: vec![],
+            plugins: crate::plugins::load().0,
+            plugin_choices: vec![],
+            plugin_form: None,
+            plugin_inbox: Default::default(),
+            plugin_runs: HashMap::new(),
+            plugin_next: 0,
             parked: None,
             server_hits: HashSet::new(),
             demo: false,
@@ -702,7 +744,7 @@ impl App {
     fn on_cursor_moved(&mut self) {
         // Keep a little context above/below the cursor, vim's scrolloff.
         let h = self.list_height.max(1);
-        let off = 3.min(h / 3);
+        let off = if self.list_row_h > 1 { 1.min(h / 3) } else { 3.min(h / 3) };
         if self.cursor < self.list_offset + off {
             self.list_offset = self.cursor.saturating_sub(off);
         } else if self.cursor + off >= self.list_offset + h {
@@ -948,6 +990,7 @@ impl App {
 
     pub fn on_tick(&mut self) {
         self.autosave_draft();
+        self.drain_plugins();
         if self.last_outbox.elapsed() >= Duration::from_secs(1) {
             self.last_outbox = Instant::now();
             self.pump_outbox();
@@ -992,11 +1035,12 @@ impl App {
                 }
             }
         }
-        if self.last_theme_check.elapsed() > Duration::from_secs(2) {
+        if self.last_theme_check.elapsed() > Duration::from_secs(1) {
             self.last_theme_check = Instant::now();
             if self.watcher.changed() {
                 let dir = self.cfg.ui.theme_dir.as_ref().map(|p| crate::theme::expand(&p.to_string_lossy()));
                 self.theme = Theme::load(dir.as_deref());
+                self.images.set_picker(crate::images::picker(self.theme.bg));
                 self.say(format!("theme · {}", self.theme.name));
             }
         }
@@ -1195,6 +1239,12 @@ impl App {
         self.count = 0;
 
         if let Some(p) = self.pending.take() {
+            if p == ';' {
+                if let KeyCode::Char(c) = k.code {
+                    self.plugin_by_key(c);
+                }
+                return;
+            }
             if p == 'g' {
                 match k.code {
                     KeyCode::Char('g') => self.top(),
@@ -1305,6 +1355,8 @@ impl App {
                 }
             }
             KeyCode::Char('z') => self.pending = Some('z'),
+            KeyCode::Char(':') => self.pick_plugin(),
+            KeyCode::Char(';') => self.pending = Some(';'),
             KeyCode::Char('/') => {
                 self.mode = Mode::Prompt(Prompt {
                     kind: PromptKind::Filter,
@@ -1829,6 +1881,224 @@ impl App {
         crate::parse::links(&b.text, b.html.as_deref()).into_iter().filter(|u| u.to_lowercase().contains(&q)).collect()
     }
 
+    // ---------------------------------------------------------------- plugins
+
+    /// `:` — every plugin action that fits this account, fuzzy-filtered.
+    fn pick_plugin(&mut self) {
+        let (plugins, errors) = crate::plugins::load();
+        self.plugins = plugins;
+        if let Some(e) = errors.first() {
+            self.fail(format!("plugin: {e}"));
+        }
+        let completions = self.plugin_completions("");
+        if completions.is_empty() {
+            if errors.is_empty() {
+                self.say(format!("no plugins: add one in {}", crate::plugins::dir().display()));
+            }
+            return;
+        }
+        self.mode = Mode::Prompt(Prompt { kind: PromptKind::Plugin, input: String::new(), sel: Some(0), completions });
+    }
+
+    fn plugin_completions(&mut self, input: &str) -> Vec<String> {
+        let account = self.accts.get(self.acct_idx()).map(|a| a.cfg.name.clone()).unwrap_or_default();
+        let q = input.trim().to_lowercase();
+        let mut out = Vec::new();
+        for (pi, p) in self.plugins.iter().enumerate() {
+            for (ai, a) in p.actions.iter().enumerate() {
+                if !a.offered_for(&account) {
+                    continue;
+                }
+                let key = a.key_char().map(|c| format!("  ;{c}")).unwrap_or_default();
+                let label = format!("{}  · {}{key}", a.title, p.name);
+                if q.is_empty() || label.to_lowercase().contains(&q) {
+                    out.push((pi, ai, label));
+                }
+            }
+        }
+        self.plugin_choices = out.clone();
+        out.into_iter().map(|c| c.2).collect()
+    }
+
+    /// `;<key>` — the plugin action bound to that key (for this account).
+    fn plugin_by_key(&mut self, c: char) {
+        let account = self.accts.get(self.acct_idx()).map(|a| a.cfg.name.clone()).unwrap_or_default();
+        let found = self.plugins.iter().enumerate().find_map(|(pi, p)| {
+            p.actions.iter().position(|a| a.key_char() == Some(c) && a.offered_for(&account)).map(|ai| (pi, ai))
+        });
+        match found {
+            Some((pi, ai)) => self.start_plugin(pi, ai),
+            None => self.say(format!(";{c}: no plugin action on that key (: lists them)")),
+        }
+    }
+
+    /// Gather the message(s) for a plugin action, then ask for its fields (if any) and run it.
+    fn start_plugin(&mut self, pi: usize, ai: usize) {
+        let Some(action) = self.plugins.get(pi).and_then(|p| p.actions.get(ai)).cloned() else { return };
+        if action.on == "marked" && self.marked.is_empty() {
+            return self.say("mark the messages first (x)");
+        }
+        let acct = self.acct_idx();
+        let folder = self.current.as_ref().map(|c| if c.0 == UNIFIED { "INBOX".to_string() } else { c.1.clone() }).unwrap_or_default();
+        let uids = self.targets();
+        let bodies: Vec<Body> = uids
+            .iter()
+            .filter_map(|&u| self.body.as_ref().filter(|b| b.uid == u).or_else(|| self.cached(u)).cloned())
+            .collect();
+        if bodies.is_empty() {
+            return self.say("open the message first, so its text is loaded");
+        }
+        let files = action.attachments.then(|| {
+            self.plugin_next += 1;
+            let d = std::env::temp_dir().join(format!("tern-plugin-{}-{}", std::process::id(), self.plugin_next));
+            let _ = std::fs::create_dir_all(&d);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700));
+            }
+            d
+        });
+        let messages = bodies
+            .iter()
+            .enumerate()
+            .map(|(n, b)| {
+                let mut saved = Vec::new();
+                if let Some(d) = &files {
+                    for i in 0..b.attachments.len() {
+                        if let Some((name, bytes)) = crate::parse::attachment_bytes(&b.raw, i) {
+                            let path = unique_path(&d.join(n.to_string()), &sanitize(&name));
+                            let _ = std::fs::create_dir_all(path.parent().unwrap());
+                            if std::fs::write(&path, bytes).is_ok() {
+                                saved.push((name, path));
+                            }
+                        }
+                    }
+                }
+                crate::plugins::message_json(b, &folder, &saved)
+            })
+            .collect();
+        let b = &bodies[0];
+        let (from_name, from_addr) = match b.from.rsplit_once(" <") {
+            Some((n, a)) => (n.trim_matches('"').to_string(), a.trim_end_matches('>').to_string()),
+            None => (String::new(), b.from.clone()),
+        };
+        let vars = vec![
+            ("subject", b.subject.clone()),
+            ("from", b.from.clone()),
+            ("from_name", if from_name.is_empty() { from_addr.clone() } else { from_name }),
+            ("from_addr", from_addr),
+            ("date", b.date.clone()),
+            ("account", self.accts.get(acct).map(|a| a.cfg.name.clone()).unwrap_or_default()),
+        ];
+        self.plugin_form = Some(PluginForm { plugin: pi, action: ai, field: 0, values: vec![], vars, acct, messages, uids, files });
+        self.next_plugin_field();
+    }
+
+    /// The prompt for the form's next field, or run the action once they're all in.
+    fn next_plugin_field(&mut self) {
+        let Some(form) = &self.plugin_form else { return };
+        let fields = &self.plugins[form.plugin].actions[form.action].fields;
+        match fields.get(form.field) {
+            Some(f) => {
+                let input = crate::plugins::expand(&f.default, &form.vars);
+                self.mode = Mode::Prompt(Prompt { kind: PromptKind::PluginField, input, sel: None, completions: vec![] });
+            }
+            None => self.run_plugin(),
+        }
+    }
+
+    /// The label of the field being asked for (for the status line).
+    pub fn plugin_field_label(&self) -> String {
+        let Some(form) = &self.plugin_form else { return String::new() };
+        let f = &self.plugins[form.plugin].actions[form.action].fields[form.field.min(usize::MAX)];
+        if f.label.is_empty() { f.name.clone() } else { f.label.clone() }
+    }
+
+    fn plugin_field_done(&mut self, value: String) {
+        let Some(form) = &mut self.plugin_form else { return };
+        let name = self.plugins[form.plugin].actions[form.action].fields[form.field].name.clone();
+        form.values.push((name, value.trim().to_string()));
+        form.field += 1;
+        self.next_plugin_field();
+    }
+
+    fn cancel_plugin_form(&mut self) {
+        if let Some(form) = self.plugin_form.take() {
+            if let Some(d) = form.files {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+        self.say("cancelled");
+    }
+
+    fn run_plugin(&mut self) {
+        let Some(form) = self.plugin_form.take() else { return };
+        let plugin = self.plugins[form.plugin].clone();
+        let action = plugin.actions[form.action].clone();
+        let (name, email) = self.accts.get(form.acct).map(|a| (a.cfg.name.clone(), a.cfg.email.clone())).unwrap_or_default();
+        let fields: serde_json::Map<String, serde_json::Value> =
+            form.values.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
+        let payload = serde_json::json!({
+            "plugin": plugin.name,
+            "action": action.id,
+            "fields": fields,
+            "account": { "name": name, "email": email },
+            "messages": form.messages,
+        });
+        self.plugin_next += 1;
+        let id = self.plugin_next;
+        self.plugin_runs.insert(id, PluginRun { name: plugin.name.clone(), current: self.current.clone(), uids: form.uids });
+        crate::plugins::spawn(&plugin, &name, &email, payload, id, self.plugin_inbox.clone(), form.files);
+        self.say(format!("{}…", action.title));
+    }
+
+    /// What running plugins reported since the last tick.
+    fn drain_plugins(&mut self) {
+        let events: Vec<(u64, crate::plugins::Event)> = self.plugin_inbox.lock().unwrap().drain(..).collect();
+        for (id, e) in events {
+            let name = self.plugin_runs.get(&id).map(|r| r.name.clone()).unwrap_or_else(|| "plugin".into());
+            match e {
+                crate::plugins::Event::Status(t) => self.say(format!("{name}: {t}")),
+                crate::plugins::Event::Done { text, url } => {
+                    self.say(match url {
+                        Some(u) => format!("{name}: {text} · {u}"),
+                        None => format!("{name}: {text}"),
+                    });
+                }
+                crate::plugins::Event::Error(t) => self.fail(format!("{name}: {t}")),
+                crate::plugins::Event::Open(u) => self.actions.push(Action::Open(u)),
+                crate::plugins::Event::Then(ops) => self.plugin_then(id, &ops),
+                crate::plugins::Event::Finished => {
+                    self.plugin_runs.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// Follow-up actions a plugin asked for, on the messages it was given, if they're
+    /// still the ones on screen.
+    fn plugin_then(&mut self, id: u64, ops: &[String]) {
+        let Some(run) = self.plugin_runs.get(&id) else { return };
+        if run.current != self.current {
+            return self.say(format!("{}: done (left the folder, so nothing else was changed)", run.name));
+        }
+        let uids: HashSet<u32> = run.uids.iter().copied().filter(|u| self.all.iter().any(|e| e.uid == *u)).collect();
+        if uids.is_empty() {
+            return;
+        }
+        let saved = std::mem::replace(&mut self.marked, uids.clone());
+        for op in ops {
+            match op.as_str() {
+                "archive" => self.archive(),
+                "read" => self.set_seen(uids.iter().copied().collect(), true),
+                "flag" => self.toggle_flag(),
+                _ => {}
+            }
+        }
+        self.marked = saved.into_iter().filter(|u| !uids.contains(u)).collect();
+    }
+
     fn pick_link(&mut self) {
         if self.body.is_none() {
             return;
@@ -1983,10 +2253,12 @@ impl App {
             PromptKind::Filter | PromptKind::CalFilter | PromptKind::PeopleFilter | PromptKind::QuickAdd | PromptKind::ConfirmDelete => vec![],
             PromptKind::Snooze => self.snooze_choices(&input),
             PromptKind::Link => self.link_completions(&input),
+            PromptKind::Plugin => self.plugin_completions(&input),
+            PromptKind::PluginField => vec![],
         };
         if let Mode::Prompt(p) = &mut self.mode {
             p.sel = match kind {
-                PromptKind::Move | PromptKind::Link => (!c.is_empty()).then_some(0),
+                PromptKind::Move | PromptKind::Link | PromptKind::Plugin => (!c.is_empty()).then_some(0),
                 _ => None,
             };
             p.completions = c;
@@ -2007,6 +2279,9 @@ impl App {
         }
         if k.code == KeyCode::Esc {
             let prev = std::mem::replace(&mut self.mode, Mode::Normal);
+            if kind == PromptKind::PluginField {
+                self.cancel_plugin_form();
+            }
             if kind == PromptKind::Filter {
                 self.filter.clear();
                 self.refilter();
@@ -2113,6 +2388,12 @@ impl App {
         let Mode::Prompt(p) = std::mem::replace(&mut self.mode, Mode::Normal) else { return };
         let picked = p.sel.and_then(|s| p.completions.get(s).cloned());
         match p.kind {
+            PromptKind::Plugin => {
+                if let Some(&(pi, ai, _)) = picked.as_ref().and_then(|t| self.plugin_choices.iter().find(|c| &c.2 == t)) {
+                    self.start_plugin(pi, ai);
+                }
+            }
+            PromptKind::PluginField => self.plugin_field_done(p.input),
             PromptKind::Filter => {
                 self.filter = p.input.trim().to_string();
                 self.refilter();
@@ -2253,6 +2534,8 @@ impl App {
         if self.hits.list.contains(at) {
             // Scroll the list itself; the selection stays put.
             let max = self.rows.len().saturating_sub(self.list_height) as isize;
+            // The wheel moves in lines; tall rows move one message at a time.
+            let d = if self.list_row_h > 1 { d.signum() * (d.abs() / self.list_row_h as isize).max(1) } else { d };
             self.list_offset = (self.list_offset as isize + d).clamp(0, max.max(0)) as usize;
         } else if self.hits.body.contains(at) {
             self.scroll_body(d);
@@ -2272,7 +2555,7 @@ impl App {
                 self.right();
             }
         } else if h.list.contains(at) && at.y > h.list.y {
-            let row = (at.y - h.list.y - 1) as usize + self.list_offset;
+            let row = (at.y - h.list.y - 1) as usize / self.list_row_h.max(1) + self.list_offset;
             if row < self.rows.len() {
                 self.focus = Focus::List;
                 if row != self.cursor {
@@ -3261,6 +3544,7 @@ mod tests {
                 acct: 0,
                 in_reply_to: String::new(),
                 references: vec![],
+                preview: String::new(),
             })
             .collect();
         a.refilter();

@@ -205,6 +205,9 @@ pub struct Ui {
     /// Draw pictures in messages (kitty, sixel or iTerm2 graphics; half blocks elsewhere).
     #[serde(default = "yes")]
     pub images: bool,
+    /// One line per message in the list instead of three (sender, subject, preview).
+    #[serde(default)]
+    pub compact_list: bool,
     /// Group the list into conversations.
     #[serde(default = "yes")]
     pub threads: bool,

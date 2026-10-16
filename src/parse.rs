@@ -60,6 +60,7 @@ pub fn envelope(
         acct: 0,
         in_reply_to: String::new(),
         references: Vec::new(),
+        preview: String::new(),
     };
     let Some(msg) = MessageParser::default().parse_headers(header) else { return env };
     if let Some(a) = msg.from().and_then(|a| a.first()) {
@@ -203,6 +204,103 @@ pub fn body(uid: u32, raw: Vec<u8>) -> Body {
     Body { raw, ..b }
 }
 
+/// One line of the body's opening words, from the header and the first bytes of the
+/// body (the list fetches only those). Quotes, attributions and signatures are left out.
+/// How much of each body the list fetches for its preview.
+pub const PREVIEW_BYTES: u32 = 2048;
+
+pub fn preview(header: &[u8], text: &[u8]) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let cut = text.len() >= PREVIEW_BYTES as usize;
+    let raw = [header, &close_cut(header, text, cut)[..]].concat();
+    let Some(msg) = MessageParser::default().parse(&raw[..]) else { return String::new() };
+    // mail-parser offers HTML-only mail as text too, but runs its paragraphs together.
+    let plain = msg.text_body.first().and_then(|&i| msg.parts.get(i)).is_some_and(|p| matches!(p.body, PartType::Text(_)));
+    let body = match (plain, msg.body_text(0), msg.body_html(0)) {
+        (true, Some(t), _) => t.into_owned(),
+        (_, _, Some(h)) => html_to_text(&h),
+        (_, Some(t), None) => t.into_owned(),
+        _ => return String::new(),
+    };
+    preview_of(&body)
+}
+
+/// Make a body cut off after its first bytes parse: drop the partial last line, trim
+/// base64 to whole groups and close the multiparts left open. Without this, mail-parser
+/// gives nothing back for a base64 part that has no closing boundary.
+fn close_cut(header: &[u8], text: &[u8], cut: bool) -> Vec<u8> {
+    let mut out = match text.iter().rposition(|&b| b == b'\n') {
+        Some(i) if cut => text[..=i].to_vec(),
+        _ => text.to_vec(),
+    };
+    let tail_start = out[..out.len().saturating_sub(1)].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let tail = String::from_utf8_lossy(&out[tail_start..]).trim_end().to_string();
+    if !tail.is_empty() && !tail.len().is_multiple_of(4) && tail.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
+        // Only a line the cut went through; a whole short line is the message itself.
+        if cut {
+            out.truncate(tail_start + tail.len() / 4 * 4);
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    let all = String::from_utf8_lossy(header).into_owned() + &String::from_utf8_lossy(&out);
+    let mut open: Vec<String> = Vec::new();
+    let lower = all.to_ascii_lowercase();
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("boundary=") {
+        let v = &all[at + i + 9..];
+        let b: String = match v.strip_prefix('"') {
+            Some(q) => q.chars().take_while(|&c| c != '"').collect(),
+            None => v.chars().take_while(|&c| !matches!(c, ';' | '\r' | '\n' | ' ')).collect(),
+        };
+        at += i + 9;
+        if !b.is_empty() && !all.contains(&format!("--{b}--")) {
+            open.push(b);
+        }
+    }
+    for b in open.iter().rev() {
+        out.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+    }
+    out
+}
+
+pub fn preview_of(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    // Stop where the reply ends: a signature, quoted text, or the header of the
+    // message being answered (Gmail wraps "On … wrote:" over two lines, Outlook
+    // writes "From: … Sent: …").
+    let mut end = lines.len();
+    for (i, l) in lines.iter().enumerate() {
+        let next = lines.get(i + 1).copied().unwrap_or("");
+        if *l == "--"
+            || l.starts_with('>')
+            || l.starts_with("-----Original Message")
+            || l.starts_with("________________________________")
+            || (l.starts_with("On ") && (l.ends_with("wrote:") || next.ends_with("wrote:")))
+            || (l.starts_with("From:") && next.starts_with("Sent:"))
+        {
+            end = i;
+            break;
+        }
+    }
+    let mut out = String::new();
+    for line in &lines[..end] {
+        // Marketing mail pads its preheader with invisible characters.
+        let words = line.split(|c: char| c.is_whitespace() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{034f}' | '\u{00ad}' | '\u{feff}' | '\u{2060}'));
+        for w in words.filter(|w| !w.is_empty()) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(w);
+        }
+        if out.len() > 300 {
+            break;
+        }
+    }
+    out
+}
+
 pub fn html_to_text(html: &str) -> String {
     html2text::from_read(html.as_bytes(), 10_000)
 }
@@ -310,5 +408,40 @@ mod tests {
         assert_eq!(links("", Some(html)), ["https://a.com/x?y=1&z=2", "http://b.org", "https://c.io/p"]);
         let text = "See https://d.dev/docs. Or (https://e.net/a_(b)) and <https://f.com/q>, http://g.com!";
         assert_eq!(links(text, None), ["https://d.dev/docs", "https://e.net/a_(b)", "https://f.com/q", "http://g.com"]);
+    }
+
+    #[test]
+    fn previews_from_the_first_bytes() {
+        // Multipart, cut off partway through the HTML part, as a partial FETCH returns it.
+        let header = b"From: a@b.c\r\nSubject: hi\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"XX\"\r\n\r\n";
+        let text = b"--XX\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHi Ted,\r\n\r\nThe numbers are in =E2=80=94 we can ship.\r\n\r\nOn Tue, Maya wrote:\r\n> old\r\n--XX\r\nContent-Type: text/html\r\n\r\n<p>Hi Ted";
+        assert_eq!(preview(header, text), "Hi Ted, The numbers are in — we can ship.");
+
+        // HTML only, with an invisible preheader pad.
+        let header = b"From: a@b.c\r\nContent-Type: text/html; charset=utf-8\r\n\r\n";
+        let text = "<html><body><div>Your receipt \u{200c}\u{200c} is ready</div><p>Amount $5</p>".as_bytes();
+        assert_eq!(preview(header, text), "Your receipt is ready Amount $5");
+
+        assert_eq!(preview(header, b""), "");
+        assert_eq!(preview_of("Thanks!\n-- \nTed"), "Thanks!");
+    }
+
+    #[test]
+    fn previews_survive_the_cut() {
+        // Outlook: nested multiparts, base64 text, cut inside the text part.
+        let header = b"From: a@b.c\r\nContent-Type: multipart/related; boundary=\"_004_\"\r\n\r\n";
+        let mut text = String::from("--_004_\r\nContent-Type: multipart/alternative; boundary=\"_000_\"\r\n\r\n--_000_\r\nContent-Type: text/plain; charset=\"utf-8\"\r\nContent-Transfer-Encoding: base64\r\n\r\nb2sgaSB0aGluayBpIGhhdmUgZXZlcnl0aGluZyB0aGVyZSBmb3Igbm93Lg0KDQpKdXN0aW4gQmluZyBS\r\n");
+        while text.len() < PREVIEW_BYTES as usize {
+            text.push_str("TiwgQlNODQpDby1Gb3VuZGVyL1ByZXNp\r\n");
+        }
+        text.truncate(PREVIEW_BYTES as usize);
+        assert!(preview(header, text.as_bytes()).starts_with("ok i think i have everything there for now. Justin Bing RN, BSN"));
+
+        // A short message on one line, without a newline, is kept whole.
+        assert_eq!(preview(b"From: a@b.c\r\n\r\n", b"Sounds good"), "Sounds good");
+
+        let gmail = "Thursday works.\n\nOn Wed, Oct 15, 2026 at 2:20 PM Justin Bing <\njustin@x.com> wrote:\n> hi";
+        assert_eq!(preview_of(gmail), "Thursday works.");
+        assert_eq!(preview_of("Done.\n\nFrom: Kelly\nSent: Tuesday\nSubject: x"), "Done.");
     }
 }

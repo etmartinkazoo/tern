@@ -4,15 +4,18 @@ A dense, vim-driven mail client for the terminal that wears your Omarchy theme.
 Website and docs: **https://ternmail.dev**
 
 ```
- tern you@x.com         │ Inbox  412 · 6 unread                  │ Re: Q4 roadmap — final cut before Friday
-▎ Inbox              6  │ ●  Maya Okafor   Re: Q4 roadmap…  03:45 │ From    Maya Okafor <maya@northwind.io>
-  Drafts                │    GitHub        [omarchy] feat…  03:22 │ To      Ted Martin <ted@example.com>
-  Sent                  │ ●  Priya Raman   Contract draft…    Tue │ Date    Wed 14 Oct 2026 03:45
-  Archive               │                                         │ ──────────────────────────────── all
-  Trash                 │                                         │ Hey,
+ tern you@x.com         │ Inbox  412 · 6 unread                   │ Re: Q4 roadmap — final cut before Friday
+▎ Inbox              6  │ ● Maya Okafor                     03:45 │ From    Maya Okafor <maya@northwind.io>
+  Drafts                │   Q4 roadmap — final cut before…    4 › │ To      Ted Martin <ted@example.com>
+  Sent                  │   Agree with Priya — billing waits unt… │ Date    Wed 14 Oct 2026 03:45
+  Archive               │   ───────────────────────────────────── │ ──────────────────────────────── all
+  Trash                 │   GitHub                          03:22 │ Hey,
 ```
 
-Sidebar · message list (40%) · message (60%). Mail (IMAP + SMTP, with push), a
+Sidebar · message list (40%) · message (60%). Each message in the list gets three
+lines, Apple Mail style: who and when; the subject, with flag, attachment and
+thread count on the right; and the first words of the message, then a hairline
+(`compact_list = true` goes back to one line each). Mail (IMAP + SMTP, with push), a
 multi-account calendar (CalDAV) and contacts (CardDAV). Google and Microsoft sign
 in with OAuth.
 
@@ -84,6 +87,11 @@ about two seconds, without a restart. Glyphs come from a Nerd Font, which
 Omarchy ships by default (set `icons = false` to turn them off). tern leaves
 the terminal's background alone, so transparency still works
 (`paint_background = true` overrides that).
+
+On [fedcandor](https://github.com/etmartinkazoo/fedcandor), tern reads the palette
+`fedcandor-theme` renders to `~/.local/state/fedcandor/theme/rendered/colors.toml`
+and follows `fedcandor-theme set` (or Super+Shift+T) live, within about a second.
+That takes precedence over Omarchy's.
 
 Other locations: `TERN_THEME_DIR=…` or `[ui] theme_dir`. If no theme is found,
 tern falls back to a built-in Tokyo Night.
@@ -327,7 +335,7 @@ tells the sender you opened the mail. **Pictures** in settings turns it off.
 
 - **General:** threads, folding, undo-send window, mark-read delay, time zone,
   today in the sidebar, notifications and reminder time, Zoom link and Meet
-  account, layout widths, icons, background, mouse, pictures, date format, download
+  account, compact list, layout widths, icons, background, mouse, pictures, date format, download
   folder and editor. Changes apply
   immediately and are saved to `config.toml`; your comments and layout there
   are kept.
@@ -354,7 +362,8 @@ Mouse:
 Messages are grouped into conversations from Message-ID, In-Reply-To and
 References. When those headers are missing, a message whose subject starts
 with "Re:" joins the oldest thread with the same subject. Each conversation is
-one row in the list: who took part, how many messages, and the latest date. A
+one entry in the list: who took part, the latest date, the subject with how many
+messages there are, and the start of the latest one. A
 new reply moves the whole thread back to the top. When a folded conversation is
 selected, the right pane shows the whole thread, oldest message first. Unread
 messages and the latest one are shown in full, the others shrink to one line,
@@ -368,6 +377,56 @@ unfolded, or `threads = false` for a flat list.
 
 Your own replies show up only if they are in the folder you're viewing. tern
 doesn't merge in your Sent folder yet.
+
+## Plugins
+
+Plugins add actions without changing tern: turn an email into a todo, file it in a CRM,
+ask an assistant about it. A plugin is any program, in any language, in its own folder
+under `~/.config/tern/plugins/`, with a `plugin.toml`:
+
+```toml
+name = "runwell"
+description = "Email → Runwell todo"
+run = ["./run"]                  # relative to the plugin's folder
+timeout_secs = 45
+
+[[actions]]
+id = "todo"
+title = "Send to Runwell as a todo"
+key = "t"                        # ;t runs it; every action is also under :
+on = "message"                   # the message (or the marked ones) | "marked"
+accounts = ["Brem", "Lumin"]     # only on these accounts (empty: all)
+attachments = false              # true: attachments are written to files for it
+fields = [{ name = "title", default = "{subject}" }, { name = "due", label = "due (optional)" }]
+```
+
+`:` lists the actions that fit the account you're in; `;` and a key runs one directly.
+Fields are asked for in the status line first, pre-filled (`{subject}` `{from}`
+`{from_name}` `{from_addr}` `{date}` `{account}`).
+
+tern runs the program in the background with one JSON object on stdin:
+
+```json
+{"plugin": "runwell", "action": "todo", "fields": {"title": "…"},
+ "account": {"name": "Brem", "email": "ted@brem.io"},
+ "messages": [{"subject": "…", "from": "…", "to": "…", "cc": "…", "date": "…",
+               "message_id": "…", "folder": "INBOX", "text": "…", "has_html": false,
+               "attachments": [{"name": "a.pdf", "path": "/tmp/…/a.pdf"}]}]}
+```
+
+and reads JSON lines from its stdout, shown as they come:
+
+| line | does |
+|---|---|
+| `{"status": "Creating…"}` | progress in the status line (plain text lines count as status) |
+| `{"done": "Created ENG-142", "url": "https://…"}` | the result |
+| `{"error": "…"}` | shown as an error (a failing exit says the last stderr line) |
+| `{"then": ["archive"]}` | then archive / read / flag those messages, if they're still on screen |
+| `{"open": "https://…"}` | open a link in the browser |
+
+It also gets `TERN_ACCOUNT`, `TERN_ACCOUNT_EMAIL` and `TERN_PLUGIN_DIR`. Plugins never
+block tern, are stopped after `timeout_secs`, and can only change mail through `then`.
+`tern doctor` lists them, and says which manifests don't parse.
 
 ## How it behaves
 

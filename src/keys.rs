@@ -78,6 +78,8 @@ pub const KEYMAP: &[Section] = &[
             ("ge", "make a calendar event from this message"),
             ("gr", "resume the unsent message autosaved last time"),
             ("y", "copy sender's address"),
+            (":", "plugins: pick an action for this message"),
+            (";x", "run the plugin action bound to x"),
             ("gc", "sync contacts now"),
         ],
     },

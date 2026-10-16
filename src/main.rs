@@ -22,6 +22,7 @@ mod keys;
 mod parse;
 mod private;
 mod people;
+mod plugins;
 mod settings;
 mod snooze;
 mod theme;

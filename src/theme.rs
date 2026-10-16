@@ -1,5 +1,7 @@
-//! Colors from the active Omarchy theme.
+//! Colors from the active fedcandor or Omarchy theme.
 //!
+//! fedcandor renders the current theme's resolved palette to
+//! `~/.local/state/fedcandor/theme/rendered/colors.toml` on every `fedcandor-theme set`.
 //! Omarchy keeps the current theme at `~/.config/omarchy/current/theme`, a symlink that
 //! `omarchy-theme-set` repoints. We read the palette from (in order) `colors.toml`,
 //! `alacritty.toml`, `kitty.conf` or `ghostty.conf`, map it onto the roles the UI uses, and
@@ -97,9 +99,16 @@ impl Theme {
         let Some(dir) = dir.map(PathBuf::from).or_else(default_dir) else {
             return Self::fallback();
         };
-        let name = std::fs::canonicalize(&dir)
+        // fedcandor's rendered palette names its theme; Omarchy's is named by its folder.
+        let name = std::fs::read_to_string(dir.join("colors.toml"))
             .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .and_then(|t| t.parse::<toml::Table>().ok())
+            .and_then(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .or_else(|| {
+                std::fs::canonicalize(&dir)
+                    .ok()
+                    .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            })
             .unwrap_or_else(|| "custom".into());
         let readers: [(&str, fn(&str) -> Palette); 4] = [
             ("colors.toml", read_colors_toml),
@@ -123,8 +132,20 @@ pub fn default_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("TERN_THEME_DIR") {
         return Some(expand(&d));
     }
-    let d = dirs::config_dir()?.join("omarchy/current/theme");
-    d.exists().then_some(d)
+    fedcandor_dir().or_else(|| {
+        let d = dirs::config_dir()?.join("omarchy/current/theme");
+        d.exists().then_some(d)
+    })
+}
+
+/// Where `fedcandor-theme` renders the current palette, if fedcandor is installed.
+fn fedcandor_dir() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))?;
+    let d = state.join("fedcandor/theme/rendered");
+    d.join("colors.toml").is_file().then_some(d)
 }
 
 pub fn expand(p: &str) -> PathBuf {
@@ -135,7 +156,8 @@ pub fn expand(p: &str) -> PathBuf {
 }
 
 /// Detects theme changes by polling the resolved directory and file mtimes. Cheap enough to
-/// run every couple of seconds, and it catches `omarchy-theme-set` swapping the symlink.
+/// run every second, and it catches `omarchy-theme-set` swapping the symlink and
+/// `fedcandor-theme` replacing its rendered `colors.toml`.
 pub struct Watcher {
     dir: Option<PathBuf>,
     stamp: Option<(PathBuf, Vec<Option<SystemTime>>)>,
@@ -310,6 +332,17 @@ mod tests {
         let p = read_colors_toml("accent = \"#ff0000\"\nbackground = \"#000000\"\ncolor4 = \"#0000ff\"\n");
         assert_eq!(p.accent, Some(Color::Rgb(255, 0, 0)));
         assert_eq!(p.ansi[4], Some(Color::Rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn names_theme_from_fedcandor_palette() {
+        let dir = std::env::temp_dir().join(format!("tern-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("colors.toml"), "name = \"candor\"\nbackground = \"#141d2b\"\n").unwrap();
+        let t = Theme::load(Some(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(t.name, "candor");
+        assert_eq!(t.bg, Color::Rgb(0x14, 0x1d, 0x2b));
     }
 
     #[test]

@@ -195,7 +195,7 @@ pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Eve
                 // Oldest first, so each reply can point at the message before it.
                 for &(c, ago, reply, seen, flagged, text) in INBOX.iter().rev() {
                     uid += 1;
-                    let (cn, ca, subject, _) = CATALOG[c];
+                    let (cn, ca, subject, body) = CATALOG[c];
                     let (from_name, from_addr) = match reply {
                         Some("") => ("Ted Martin", "ted@example.com"),
                         Some(n) => (n, PEOPLE_ADDR.iter().find(|p| p.0 == n).map(|p| p.1).unwrap_or(ca)),
@@ -222,13 +222,14 @@ pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Eve
                         acct: 0,
                         in_reply_to: parent.clone(),
                         references: if parent.is_empty() { vec![] } else { vec![parent] },
+                        preview: crate::parse::preview_of(if text.is_empty() { body } else { text }),
                     });
                 }
                 v.sort_by(|a, b| b.date.cmp(&a.date));
             } else {
                 for i in 0..n {
                     uid += 1;
-                    let (pn, pe, subject, _) = CATALOG[(i * 7 + bi) % CATALOG.len()];
+                    let (pn, pe, subject, body) = CATALOG[(i * 7 + bi) % CATALOG.len()];
                     v.push(Envelope {
                         uid,
                         from_name: if bi == 2 { "Ted Martin".into() } else { pn.into() },
@@ -244,6 +245,7 @@ pub fn spawn(idx: usize, mut rx: UnboundedReceiver<Cmd>, tx: UnboundedSender<Eve
                         acct: 0,
                         in_reply_to: String::new(),
                         references: vec![],
+                        preview: crate::parse::preview_of(body),
                     });
                 }
             }
