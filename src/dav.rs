@@ -408,7 +408,19 @@ pub fn sync_calendars(sources: &[Source]) -> Result<(Vec<CachedCalendar>, Vec<St
     for src in sources {
         let r: Result<()> = (|| {
             let mut c = client(src)?;
-            for cal in list_calendars(&mut c)? {
+            let calendars = match list_calendars(&mut c) {
+                Ok(v) => v,
+                // A contacts-only server (Fastmail's carddav.fastmail.com, say) has no
+                // calendars to find: not an error, as long as it does have address books.
+                Err(e) => {
+                    let contacts_only = client(src).and_then(|mut c| c.home(Kind::Contacts)).is_ok();
+                    if contacts_only {
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
+            for cal in calendars {
                 if !cal.components.is_empty() && !cal.components.iter().any(|x| x.eq_ignore_ascii_case("VEVENT")) {
                     continue;
                 }
